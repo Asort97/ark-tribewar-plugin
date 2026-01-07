@@ -1,0 +1,46 @@
+# Root ignore (Visual Studio / C++ / ArkApi plugins)
+
+# VS
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.VC.opendb
+*.ipch
+
+# Build outputs
+**/Debug/
+**/Release/
+**/x64/
+**/x86/
+**/bin/
+**/obj/
+**/out_lib/
+**/*.tlog/
+
+# Artifacts
+**/*.dll
+**/*.lib
+**/*.exp
+**/*.pdb
+**/*.iobj
+**/*.ipdb
+**/*.ilk
+
+# Logs / dumps
+**/*.log
+**/*.dmp
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# CMake (if any)
+CMakeFiles/
+CMakeCache.txt
+cmake-build-*/
+mcrcon.exe
+Ark-Server-Plugins
+ARK-Server-API
