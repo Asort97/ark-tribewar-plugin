@@ -28,6 +28,13 @@ constexpr int kMenuAcceptCancelId = 910004;
 constexpr int kMenuDeclareListBaseId = 910100;
 constexpr int kMenuDeclareListMax = 64;
 
+// MultiUse wheel identifiers MUST be small on some versions (often treated as a byte).
+// Using huge values (910xxx) can cause options to not render or not be selectable.
+constexpr int kMuDeclareListBaseId = 180; // 180..243 (64 entries)
+constexpr int kMuStatusId = 244;
+constexpr int kMuCancelId = 245;
+constexpr int kMuAcceptCancelId = 246;
+
 #if TRIBEWAR_ENABLE_RADIAL
 // ArkApi headers in this workspace do not provide a native definition for the tribe radial menu entry.
 // We provide a minimal definition that matches the fields we need to populate.
@@ -54,8 +61,12 @@ struct Config
     // enable_tribe_radial_menu: experimental, depends on client/game version.
     bool enable_multiuse_menu = true;
     bool multiuse_require_owned_structure = true;
+    bool multiuse_require_leader = true;
     int32_t multiuse_max_targets = 24;
     bool enable_tribe_radial_menu = false;
+
+    // Diagnostics
+    bool debug_multiuse_log = false;
 
     // Self-test mode: creates a synthetic war and drives it through phases
     // so that functionality can be validated without any players.
@@ -148,6 +159,11 @@ std::string GetSelfTestLogPath()
     return GetPluginDir() + "/self_test.log";
 }
 
+std::string GetMultiUseDebugLogPath()
+{
+    return GetPluginDir() + "/multiuse_debug.log";
+}
+
 bool FileExists(const std::string& path)
 {
     std::error_code ec;
@@ -165,6 +181,24 @@ void AppendSelfTestLog(const std::string& message)
     {
         std::filesystem::create_directories(std::filesystem::path(GetSelfTestLogPath()).parent_path());
         std::ofstream f(GetSelfTestLogPath(), std::ios::app);
+        if (!f.is_open())
+            return;
+        f << Now() << " " << message << "\n";
+    }
+    catch (...)
+    {
+    }
+}
+
+void AppendMultiUseDebugLog(const std::string& message)
+{
+    if (!config.debug_multiuse_log)
+        return;
+
+    try
+    {
+        std::filesystem::create_directories(std::filesystem::path(GetMultiUseDebugLogPath()).parent_path());
+        std::ofstream f(GetMultiUseDebugLogPath(), std::ios::app);
         if (!f.is_open())
             return;
         f << Now() << " " << message << "\n";
@@ -355,8 +389,11 @@ void SaveConfig()
 
     json["enable_multiuse_menu"] = config.enable_multiuse_menu;
     json["multiuse_require_owned_structure"] = config.multiuse_require_owned_structure;
+    json["multiuse_require_leader"] = config.multiuse_require_leader;
     json["multiuse_max_targets"] = config.multiuse_max_targets;
     json["enable_tribe_radial_menu"] = config.enable_tribe_radial_menu;
+
+    json["debug_multiuse_log"] = config.debug_multiuse_log;
 
     json["self_test"] = config.self_test;
     json["self_test_tribe_a"] = config.self_test_tribe_a;
@@ -384,8 +421,11 @@ void LoadConfig()
 
         config.enable_multiuse_menu = json.value("enable_multiuse_menu", config.enable_multiuse_menu);
         config.multiuse_require_owned_structure = json.value("multiuse_require_owned_structure", config.multiuse_require_owned_structure);
+        config.multiuse_require_leader = json.value("multiuse_require_leader", config.multiuse_require_leader);
         config.multiuse_max_targets = json.value("multiuse_max_targets", config.multiuse_max_targets);
         config.enable_tribe_radial_menu = json.value("enable_tribe_radial_menu", config.enable_tribe_radial_menu);
+
+        config.debug_multiuse_log = json.value("debug_multiuse_log", config.debug_multiuse_log);
 
         config.self_test = json.value("self_test", config.self_test);
         config.self_test_tribe_a = json.value("self_test_tribe_a", config.self_test_tribe_a);
@@ -1022,19 +1062,21 @@ void HandleMenuAction(AShooterPlayerController* pc, int entry_id)
         return;
 
     const auto tribe_id = GetTribeIdFromPlayer(pc);
-    if (tribe_id == 0 || !IsTribeLeaderOrAdmin(pc))
+    if (tribe_id == 0)
+        return;
+    if (config.multiuse_require_leader && !IsTribeLeaderOrAdmin(pc))
         return;
 
     const auto now = Now();
 
-    if (entry_id == kMenuStatusId)
+    if (entry_id == kMenuStatusId || entry_id == kMuStatusId)
     {
         const auto war = GetWarForTribeCopy(tribe_id);
         SendPlayerMessage(pc, GetStatusText(war ? &(*war) : nullptr, tribe_id).ToString());
         return;
     }
 
-    if (entry_id == kMenuCancelId)
+    if (entry_id == kMenuCancelId || entry_id == kMuCancelId)
     {
         if (!GetWarForTribeCopy(tribe_id).has_value())
         {
@@ -1045,7 +1087,7 @@ void HandleMenuAction(AShooterPlayerController* pc, int entry_id)
         return;
     }
 
-    if (entry_id == kMenuAcceptCancelId)
+    if (entry_id == kMenuAcceptCancelId || entry_id == kMuAcceptCancelId)
     {
         if (!GetWarForTribeCopy(tribe_id).has_value())
         {
@@ -1061,7 +1103,9 @@ void HandleMenuAction(AShooterPlayerController* pc, int entry_id)
         return;
     }
 
-    if (entry_id >= kMenuDeclareListBaseId && entry_id < kMenuDeclareListBaseId + kMenuDeclareListMax)
+    const bool is_radial_declare = (entry_id >= kMenuDeclareListBaseId && entry_id < kMenuDeclareListBaseId + kMenuDeclareListMax);
+    const bool is_mu_declare = (entry_id >= kMuDeclareListBaseId && entry_id < kMuDeclareListBaseId + kMenuDeclareListMax);
+    if (is_radial_declare || is_mu_declare)
     {
         const auto player_key = GetPlayerKey(pc);
         if (player_key == 0)
@@ -1229,7 +1273,7 @@ static void BuildDeclareListMultiUse(AShooterPlayerController* pc, int64_t tribe
         if (GetWarForTribeCopy(data.TribeIDField()).has_value() || IsTribeInCooldown(data.TribeIDField(), now))
             continue;
 
-        const int entry_id = kMenuDeclareListBaseId + list_count;
+        const int entry_id = kMuDeclareListBaseId + list_count;
         const auto label = FString::Format("Declare war: {}", data.TribeNameField().ToString().c_str());
         AddMultiUseEntry(entries, entry_id, label);
         declare_targets[player_key][entry_id] = data.TribeIDField();
@@ -1238,10 +1282,11 @@ static void BuildDeclareListMultiUse(AShooterPlayerController* pc, int64_t tribe
 }
 
 DECLARE_HOOK(APrimalStructure_GetMultiUseEntries, void, APrimalStructure*, APlayerController*, TArray<FMultiUseEntry>*);
-void Hook_APrimalStructure_GetMultiUseEntries(APrimalStructure* structure, APlayerController* for_pc, TArray<FMultiUseEntry>* entries)
-{
-    APrimalStructure_GetMultiUseEntries_original(structure, for_pc, entries);
 
+DECLARE_HOOK(APrimalStructure_TryMultiUse, bool, APrimalStructure*, APlayerController*, int);
+
+static void MaybeAddMultiUseMenu(APrimalStructure* structure, APlayerController* for_pc, TArray<FMultiUseEntry>* entries, const char* hook_name)
+{
     if (!plugin_initialized)
         return;
     if (!config.enable_multiuse_menu)
@@ -1254,48 +1299,145 @@ void Hook_APrimalStructure_GetMultiUseEntries(APrimalStructure* structure, APlay
         return;
 
     const auto tribe_id = GetTribeIdFromPlayer(pc);
-    if (tribe_id == 0 || !IsTribeLeaderOrAdmin(pc))
+    if (tribe_id == 0)
+    {
+        AppendMultiUseDebugLog(std::string(hook_name) + ": skip (tribe_id=0)");
         return;
+    }
 
-    if (config.multiuse_require_owned_structure && !structure->IsOfTribe(static_cast<int>(tribe_id)))
+    const bool is_leader = IsTribeLeaderOrAdmin(pc);
+    if (config.multiuse_require_leader && !is_leader)
+    {
+        AppendMultiUseDebugLog(std::string(hook_name) + ": skip (not leader/admin) tribe_id=" + std::to_string(tribe_id));
         return;
+    }
 
-    AddMultiUseEntry(entries, kMenuStatusId, FString("Tribe War: Status"));
-    AddMultiUseEntry(entries, kMenuCancelId, FString("Tribe War: Cancel"));
+    const bool owned_ok = !config.multiuse_require_owned_structure || structure->IsOfTribe(static_cast<int>(tribe_id));
+    if (!owned_ok)
+    {
+        AppendMultiUseDebugLog(std::string(hook_name) + ": skip (not owned structure) tribe_id=" + std::to_string(tribe_id));
+        return;
+    }
+
+    const int before = entries->Num();
+    AddMultiUseEntry(entries, kMuStatusId, FString("Tribe War: Status"), 10);
+    AddMultiUseEntry(entries, kMuCancelId, FString("Tribe War: Cancel"), 10);
     if (HasIncomingCancel(tribe_id))
-        AddMultiUseEntry(entries, kMenuAcceptCancelId, FString("Tribe War: Accept Cancel"));
+        AddMultiUseEntry(entries, kMuAcceptCancelId, FString("Tribe War: Accept Cancel"), 10);
 
     BuildDeclareListMultiUse(pc, tribe_id, entries);
+    const int after = entries->Num();
+
+    AppendMultiUseDebugLog(std::string(hook_name) + ": added entries before=" + std::to_string(before) + " after=" + std::to_string(after) +
+                           " tribe_id=" + std::to_string(tribe_id) + " leader=" + std::string(is_leader ? "1" : "0") +
+                           " owned_ok=" + std::string(owned_ok ? "1" : "0"));
 }
 
-DECLARE_HOOK(APrimalStructure_TryMultiUse, bool, APrimalStructure*, APlayerController*, int);
-bool Hook_APrimalStructure_TryMultiUse(APrimalStructure* structure, APlayerController* for_pc, int use_index)
+static bool MaybeHandleMultiUse(APrimalStructure* structure, APlayerController* for_pc, int use_index, const char* hook_name)
 {
     if (!plugin_initialized)
-        return APrimalStructure_TryMultiUse_original(structure, for_pc, use_index);
+        return false;
+    if (!config.enable_multiuse_menu)
+        return false;
+    if (!for_pc)
+        return false;
 
-    if (config.enable_multiuse_menu && for_pc)
+        if (!(use_index == kMenuStatusId || use_index == kMenuCancelId || use_index == kMenuAcceptCancelId ||
+            use_index == kMuStatusId || use_index == kMuCancelId || use_index == kMuAcceptCancelId ||
+            (use_index >= kMuDeclareListBaseId && use_index < kMuDeclareListBaseId + kMenuDeclareListMax) ||
+            (use_index >= kMenuDeclareListBaseId && use_index < kMenuDeclareListBaseId + kMenuDeclareListMax)))
+        return false;
+
+    auto* pc = static_cast<AShooterPlayerController*>(for_pc);
+    if (!pc)
+        return false;
+
+    const auto tribe_id = GetTribeIdFromPlayer(pc);
+    if (tribe_id == 0)
     {
-        if (use_index == kMenuStatusId || use_index == kMenuCancelId || use_index == kMenuAcceptCancelId ||
-            (use_index >= kMenuDeclareListBaseId && use_index < kMenuDeclareListBaseId + kMenuDeclareListMax))
+        AppendMultiUseDebugLog(std::string(hook_name) + ": deny use_index=" + std::to_string(use_index) + " (tribe_id=0)");
+        return false;
+    }
+
+    const bool is_leader = IsTribeLeaderOrAdmin(pc);
+    if (config.multiuse_require_leader && !is_leader)
+    {
+        AppendMultiUseDebugLog(std::string(hook_name) + ": deny use_index=" + std::to_string(use_index) + " (not leader/admin) tribe_id=" + std::to_string(tribe_id));
+        return false;
+    }
+
+    if (config.multiuse_require_owned_structure)
+    {
+        if (!structure || !structure->IsOfTribe(static_cast<int>(tribe_id)))
         {
-            auto* pc = static_cast<AShooterPlayerController*>(for_pc);
-            if (pc)
-            {
-                const auto tribe_id = GetTribeIdFromPlayer(pc);
-                if (tribe_id != 0 && IsTribeLeaderOrAdmin(pc))
-                {
-                    if (!config.multiuse_require_owned_structure || (structure && structure->IsOfTribe(static_cast<int>(tribe_id))))
-                    {
-                        HandleMenuAction(pc, use_index);
-                        return true;
-                    }
-                }
-            }
+            AppendMultiUseDebugLog(std::string(hook_name) + ": deny use_index=" + std::to_string(use_index) + " (not owned structure) tribe_id=" + std::to_string(tribe_id));
+            return false;
         }
     }
 
+    AppendMultiUseDebugLog(std::string(hook_name) + ": handle use_index=" + std::to_string(use_index) + " tribe_id=" + std::to_string(tribe_id));
+    HandleMenuAction(pc, use_index);
+    return true;
+}
+
+void Hook_APrimalStructure_GetMultiUseEntries(APrimalStructure* structure, APlayerController* for_pc, TArray<FMultiUseEntry>* entries)
+{
+    APrimalStructure_GetMultiUseEntries_original(structure, for_pc, entries);
+    MaybeAddMultiUseMenu(structure, for_pc, entries, "APrimalStructure.GetMultiUseEntries");
+}
+
+bool Hook_APrimalStructure_TryMultiUse(APrimalStructure* structure, APlayerController* for_pc, int use_index)
+{
+    if (MaybeHandleMultiUse(structure, for_pc, use_index, "APrimalStructure.TryMultiUse"))
+        return true;
     return APrimalStructure_TryMultiUse_original(structure, for_pc, use_index);
+}
+
+// Some versions/modded structures route MultiUse through Blueprint events.
+// Hook these too for compatibility and better diagnostics.
+DECLARE_HOOK(APrimalStructure_BPGetMultiUseEntries, void, APrimalStructure*, APlayerController*, TArray<FMultiUseEntry>*);
+void Hook_APrimalStructure_BPGetMultiUseEntries(APrimalStructure* structure, APlayerController* for_pc, TArray<FMultiUseEntry>* entries)
+{
+    APrimalStructure_BPGetMultiUseEntries_original(structure, for_pc, entries);
+    MaybeAddMultiUseMenu(structure, for_pc, entries, "APrimalStructure.BPGetMultiUseEntries");
+}
+
+DECLARE_HOOK(APrimalStructure_BPTryMultiUse, bool, APrimalStructure*, APlayerController*, int);
+bool Hook_APrimalStructure_BPTryMultiUse(APrimalStructure* structure, APlayerController* for_pc, int use_index)
+{
+    if (MaybeHandleMultiUse(structure, for_pc, use_index, "APrimalStructure.BPTryMultiUse"))
+        return true;
+    return APrimalStructure_BPTryMultiUse_original(structure, for_pc, use_index);
+}
+
+DECLARE_HOOK(APrimalStructureItemContainer_GetMultiUseEntries, void, APrimalStructure*, APlayerController*, TArray<FMultiUseEntry>*);
+void Hook_APrimalStructureItemContainer_GetMultiUseEntries(APrimalStructure* structure, APlayerController* for_pc, TArray<FMultiUseEntry>* entries)
+{
+    APrimalStructureItemContainer_GetMultiUseEntries_original(structure, for_pc, entries);
+    MaybeAddMultiUseMenu(structure, for_pc, entries, "APrimalStructureItemContainer.GetMultiUseEntries");
+}
+
+DECLARE_HOOK(APrimalStructureItemContainer_TryMultiUse, bool, APrimalStructure*, APlayerController*, int);
+bool Hook_APrimalStructureItemContainer_TryMultiUse(APrimalStructure* structure, APlayerController* for_pc, int use_index)
+{
+    if (MaybeHandleMultiUse(structure, for_pc, use_index, "APrimalStructureItemContainer.TryMultiUse"))
+        return true;
+    return APrimalStructureItemContainer_TryMultiUse_original(structure, for_pc, use_index);
+}
+
+DECLARE_HOOK(APrimalStructureItemContainer_BPGetMultiUseEntries, void, APrimalStructure*, APlayerController*, TArray<FMultiUseEntry>*);
+void Hook_APrimalStructureItemContainer_BPGetMultiUseEntries(APrimalStructure* structure, APlayerController* for_pc, TArray<FMultiUseEntry>* entries)
+{
+    APrimalStructureItemContainer_BPGetMultiUseEntries_original(structure, for_pc, entries);
+    MaybeAddMultiUseMenu(structure, for_pc, entries, "APrimalStructureItemContainer.BPGetMultiUseEntries");
+}
+
+DECLARE_HOOK(APrimalStructureItemContainer_BPTryMultiUse, bool, APrimalStructure*, APlayerController*, int);
+bool Hook_APrimalStructureItemContainer_BPTryMultiUse(APrimalStructure* structure, APlayerController* for_pc, int use_index)
+{
+    if (MaybeHandleMultiUse(structure, for_pc, use_index, "APrimalStructureItemContainer.BPTryMultiUse"))
+        return true;
+    return APrimalStructureItemContainer_BPTryMultiUse_original(structure, for_pc, use_index);
 }
 
 void InitPlugin();
@@ -1593,6 +1735,11 @@ void InitPlugin()
     LoadConfig();
     LoadData();
 
+    AppendMultiUseDebugLog(std::string("InitPlugin: enable_multiuse_menu=") + (config.enable_multiuse_menu ? "true" : "false") +
+                           " require_owned=" + (config.multiuse_require_owned_structure ? "true" : "false") +
+                           " require_leader=" + (config.multiuse_require_leader ? "true" : "false") +
+                           " max_targets=" + std::to_string(config.multiuse_max_targets));
+
     // Ensure data.json gets created even on empty state and even if the process
     // terminates without a clean plugin unload.
     if (!FileExists(GetDataPath()))
@@ -1611,11 +1758,38 @@ void Load()
 {
     try
     {
+        // Initialize early so config (incl. debug_multiuse_log) is loaded before hook logging.
+        InitPlugin();
+
+        auto set_hook_logged = [](const char* name, auto hook_fn, auto* original_fn)
+        {
+            try
+            {
+                ArkApi::GetHooks().SetHook(name, hook_fn, original_fn);
+                AppendMultiUseDebugLog(std::string("SetHook OK: ") + name);
+            }
+            catch (const std::exception& e)
+            {
+                AppendMultiUseDebugLog(std::string("SetHook FAIL: ") + name + " ex=" + e.what());
+            }
+            catch (...)
+            {
+                AppendMultiUseDebugLog(std::string("SetHook FAIL: ") + name + " ex=unknown");
+            }
+        };
+
         ArkApi::GetHooks().SetHook("AShooterGameMode.Tick", &Hook_AShooterGameMode_Tick, &AShooterGameMode_Tick_original);
         ArkApi::GetHooks().SetHook("APrimalStructure.TakeDamage", &Hook_APrimalStructure_TakeDamage, &APrimalStructure_TakeDamage_original);
 
-    ArkApi::GetHooks().SetHook("APrimalStructure.GetMultiUseEntries", &Hook_APrimalStructure_GetMultiUseEntries, &APrimalStructure_GetMultiUseEntries_original);
-    ArkApi::GetHooks().SetHook("APrimalStructure.TryMultiUse", &Hook_APrimalStructure_TryMultiUse, &APrimalStructure_TryMultiUse_original);
+        set_hook_logged("APrimalStructure.GetMultiUseEntries", &Hook_APrimalStructure_GetMultiUseEntries, &APrimalStructure_GetMultiUseEntries_original);
+        set_hook_logged("APrimalStructure.TryMultiUse", &Hook_APrimalStructure_TryMultiUse, &APrimalStructure_TryMultiUse_original);
+        set_hook_logged("APrimalStructure.BPGetMultiUseEntries", &Hook_APrimalStructure_BPGetMultiUseEntries, &APrimalStructure_BPGetMultiUseEntries_original);
+        set_hook_logged("APrimalStructure.BPTryMultiUse", &Hook_APrimalStructure_BPTryMultiUse, &APrimalStructure_BPTryMultiUse_original);
+
+        set_hook_logged("APrimalStructureItemContainer.GetMultiUseEntries", &Hook_APrimalStructureItemContainer_GetMultiUseEntries, &APrimalStructureItemContainer_GetMultiUseEntries_original);
+        set_hook_logged("APrimalStructureItemContainer.TryMultiUse", &Hook_APrimalStructureItemContainer_TryMultiUse, &APrimalStructureItemContainer_TryMultiUse_original);
+        set_hook_logged("APrimalStructureItemContainer.BPGetMultiUseEntries", &Hook_APrimalStructureItemContainer_BPGetMultiUseEntries, &APrimalStructureItemContainer_BPGetMultiUseEntries_original);
+        set_hook_logged("APrimalStructureItemContainer.BPTryMultiUse", &Hook_APrimalStructureItemContainer_BPTryMultiUse, &APrimalStructureItemContainer_BPTryMultiUse_original);
         
 #if TRIBEWAR_ENABLE_RADIAL
         ArkApi::GetHooks().SetHook("AShooterPlayerController.GetTribeRadialMenuEntries", &Hook_AShooterPlayerController_GetTribeRadialMenuEntries, &AShooterPlayerController_GetTribeRadialMenuEntries_original);
@@ -1644,6 +1818,15 @@ void Unload()
 
         ArkApi::GetHooks().DisableHook("APrimalStructure.GetMultiUseEntries", &Hook_APrimalStructure_GetMultiUseEntries);
         ArkApi::GetHooks().DisableHook("APrimalStructure.TryMultiUse", &Hook_APrimalStructure_TryMultiUse);
+
+        ArkApi::GetHooks().DisableHook("APrimalStructure.BPGetMultiUseEntries", &Hook_APrimalStructure_BPGetMultiUseEntries);
+        ArkApi::GetHooks().DisableHook("APrimalStructure.BPTryMultiUse", &Hook_APrimalStructure_BPTryMultiUse);
+
+        ArkApi::GetHooks().DisableHook("APrimalStructureItemContainer.GetMultiUseEntries", &Hook_APrimalStructureItemContainer_GetMultiUseEntries);
+        ArkApi::GetHooks().DisableHook("APrimalStructureItemContainer.TryMultiUse", &Hook_APrimalStructureItemContainer_TryMultiUse);
+
+        ArkApi::GetHooks().DisableHook("APrimalStructureItemContainer.BPGetMultiUseEntries", &Hook_APrimalStructureItemContainer_BPGetMultiUseEntries);
+        ArkApi::GetHooks().DisableHook("APrimalStructureItemContainer.BPTryMultiUse", &Hook_APrimalStructureItemContainer_BPTryMultiUse);
         
 #if TRIBEWAR_ENABLE_RADIAL
         ArkApi::GetHooks().DisableHook("AShooterPlayerController.GetTribeRadialMenuEntries", &Hook_AShooterPlayerController_GetTribeRadialMenuEntries);

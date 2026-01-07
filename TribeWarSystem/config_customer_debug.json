@@ -1,0 +1,15 @@
+{
+  "war_delay_seconds": 10,
+  "cooldown_seconds": 30,
+
+  "enable_multiuse_menu": true,
+  "multiuse_require_owned_structure": false,
+  "multiuse_require_leader": false,
+  "multiuse_max_targets": 24,
+
+  "enable_tribe_radial_menu": false,
+
+  "debug_multiuse_log": true,
+
+  "self_test": false
+}
