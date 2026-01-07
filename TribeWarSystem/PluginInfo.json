@@ -1,0 +1,6 @@
+{
+  "FullName": "TribeWarSystem",
+  "Description": "Tribe wars with server-side MultiUse radial menu (no chat commands)",
+  "Version": 1.0,
+  "MinApiVersion": 3.56
+}
