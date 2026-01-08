@@ -1279,8 +1279,6 @@ void BuildDeclareListMenu(AShooterPlayerController* pc, TArray<FTribeRadialMenuE
             break;
         if (data.TribeIDField() == tribe_id)
             continue;
-        if (!IsTribeLeaderOrAdminOnline(data.TribeIDField()))
-            continue;
         if (GetWarForTribeCopy(data.TribeIDField()).has_value() || IsTribeInCooldown(data.TribeIDField(), now))
             continue;
 
@@ -1382,8 +1380,6 @@ static void BuildDeclareListMultiUse(AShooterPlayerController* pc, int64_t tribe
             break;
         auto& data = const_cast<FTribeData&>(tribes[i]);
         if (data.TribeIDField() == tribe_id)
-            continue;
-        if (!IsTribeLeaderOrAdminOnline(data.TribeIDField()))
             continue;
         if (GetWarForTribeCopy(data.TribeIDField()).has_value() || IsTribeInCooldown(data.TribeIDField(), now))
             continue;
@@ -1698,15 +1694,13 @@ void CmdWarDeclare(AShooterPlayerController* pc, FString*, EChatSendMode::Type)
     if (!game_mode)
         return;
 
-    FString message(L"Доступные племена для объявления войны:\n");
+    FString message(L"Список племён:\n");
     int count = 0;
     const auto& tribes = game_mode->TribesDataField();
     for (int i = 0; i < tribes.Num(); ++i)
     {
         auto& data = const_cast<FTribeData&>(tribes[i]);
         if (data.TribeIDField() == tribe_id)
-            continue;
-        if (!IsTribeLeaderOrAdminOnline(data.TribeIDField()))
             continue;
         if (GetWarForTribeCopy(data.TribeIDField()).has_value() || IsTribeInCooldown(data.TribeIDField(), now))
             continue;
@@ -1721,7 +1715,8 @@ void CmdWarDeclare(AShooterPlayerController* pc, FString*, EChatSendMode::Type)
         return;
     }
 
-    message += L"\nИспользуйте /war <tribe_id>, чтобы объявить войну.";
+    message += L"\nИспользуйте /war <tribe_id>, чтобы объявить войну.\n";
+    message += L"Если лидер/админ выбранного племени не в сети, объявить войну не получится.";
     SendPlayerMessage(pc, message);
 }
 
