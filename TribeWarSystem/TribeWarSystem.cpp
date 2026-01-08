@@ -1,5 +1,8 @@
-#include <API/ARK/Ark.h>
+﻿#include <API/ARK/Ark.h>
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <Windows.h>
 #include <algorithm>
 #include <chrono>
@@ -18,8 +21,8 @@
 
 namespace
 {
-#define TRIBEWAR_ENABLE_RADIAL 1
-#define TRIBEWAR_ENABLE_CHAT_COMMANDS 0
+#define TRIBEWAR_ENABLE_RADIAL 0
+#define TRIBEWAR_ENABLE_CHAT_COMMANDS 1
 constexpr int kMenuRootId = 910000;
 constexpr int kMenuDeclareId = 910001;
 constexpr int kMenuStatusId = 910002;
@@ -55,6 +58,11 @@ struct Config
 {
     int32_t war_delay_seconds = 12 * 60 * 60;
     int32_t cooldown_seconds = 48 * 60 * 60;
+
+    // Structure damage
+    // Applied only when damage is allowed because of an active war (opposing sides).
+    // 1.0 = normal damage, 0.5 = half damage, 0.0 = no structure damage during war.
+    float structure_damage_multiplier = 1.0f;
 
     // UI integration
     // enable_multiuse_menu: adds actions to the existing MultiUse wheel (server-side, no client mod).
@@ -131,11 +139,16 @@ Config config;
 std::unordered_map<int64_t, WarRecord> wars_by_id;
 std::unordered_map<int64_t, int64_t> tribe_to_war_id;
 std::unordered_map<uint64_t, std::unordered_map<int, int64_t>> declare_targets;
+
+// Dynamic UseIndex mapping: for each player, store what UseIndex maps to what action.
+// action codes: 1=status, 2=cancel, 3=accept_cancel, 100+N=declare_target[N]
+std::unordered_map<uint64_t, std::unordered_map<int, int>> multiuse_action_map;
+
 int64_t next_war_id = 1;
 bool auto_timers_enabled = true;
 bool plugin_initialized = false;
 std::atomic<bool> need_save { false };
-std::vector<std::pair<int64_t, std::string>> pending_notifications;
+std::vector<std::pair<int64_t, FString>> pending_notifications;
 DataMutex notification_mutex;
 
 
@@ -386,6 +399,7 @@ void SaveConfig()
     nlohmann::json json;
     json["war_delay_seconds"] = config.war_delay_seconds;
     json["cooldown_seconds"] = config.cooldown_seconds;
+    json["structure_damage_multiplier"] = config.structure_damage_multiplier;
 
     json["enable_multiuse_menu"] = config.enable_multiuse_menu;
     json["multiuse_require_owned_structure"] = config.multiuse_require_owned_structure;
@@ -418,6 +432,7 @@ void LoadConfig()
         file >> json;
         config.war_delay_seconds = json.value("war_delay_seconds", config.war_delay_seconds);
         config.cooldown_seconds = json.value("cooldown_seconds", config.cooldown_seconds);
+        config.structure_damage_multiplier = json.value("structure_damage_multiplier", config.structure_damage_multiplier);
 
         config.enable_multiuse_menu = json.value("enable_multiuse_menu", config.enable_multiuse_menu);
         config.multiuse_require_owned_structure = json.value("multiuse_require_owned_structure", config.multiuse_require_owned_structure);
@@ -560,15 +575,16 @@ bool IsTribeLeaderOrAdminOnline(int64_t tribe_id)
     return false;
 }
 
-void SendPlayerMessage(AShooterPlayerController* pc, const std::string& message)
+void SendPlayerMessage(AShooterPlayerController* pc, const FString& message)
 {
     if (!pc)
         return;
-    ArkApi::GetApiUtils().SendChatMessage(pc, "Tribe War", message.c_str());
-    ArkApi::GetApiUtils().SendNotification(pc, FLinearColor(1.0f, 0.85f, 0.1f, 1.0f), 1.0f, 6.0f, nullptr, message.c_str());
+    const FString sender_name(L"Mega Tribe War");
+    ArkApi::GetApiUtils().SendChatMessage(pc, sender_name, L"{}", *message);
+    ArkApi::GetApiUtils().SendNotification(pc, FLinearColor(1.0f, 0.85f, 0.1f, 1.0f), 1.0f, 6.0f, nullptr, L"{}", *message);
 }
 
-void NotifyTribe(int64_t tribe_id, const std::string& message)
+void NotifyTribe(int64_t tribe_id, const FString& message)
 {
     if (ArkApi::GetApiUtils().GetStatus() != ArkApi::ServerStatus::Ready)
         return;
@@ -586,15 +602,12 @@ void NotifyTribe(int64_t tribe_id, const std::string& message)
     }
 }
 
-std::string FormatDuration(int64_t seconds)
+FString FormatDuration(int64_t seconds)
 {
     const int64_t hours = seconds / 3600;
     const int64_t minutes = (seconds % 3600) / 60;
     const int64_t secs = seconds % 60;
-
-    char buffer[64] = {0};
-    sprintf_s(buffer, "%lldh %lldm %llds", hours, minutes, secs);
-    return buffer;
+    return FString::Format(L"{}ч {}м {}с", hours, minutes, secs);
 }
 
 WarRecord* GetWarForTribeLocked(int64_t tribe_id)
@@ -667,35 +680,35 @@ bool CleanupExpiredWarsLocked(int64_t now)
     return !to_remove.empty();
 }
 
-bool IsWarAllowed(int64_t tribe_a, int64_t tribe_b, int64_t now, std::string& reason)
+bool IsWarAllowed(int64_t tribe_a, int64_t tribe_b, int64_t now, FString& reason)
 {
     if (tribe_a == 0 || tribe_b == 0)
     {
-        reason = "You must be in a tribe.";
+        reason = L"Вы должны состоять в племени.";
         return false;
     }
 
     if (tribe_a == tribe_b)
     {
-        reason = "You cannot declare war on your own tribe.";
+        reason = L"Нельзя объявить войну своему племени.";
         return false;
     }
 
     if (GetWarForTribeCopy(tribe_a).has_value() || GetWarForTribeCopy(tribe_b).has_value())
     {
-        reason = "A tribe already has an active war or cooldown.";
+        reason = L"У одного из племён уже есть активная война или откат.";
         return false;
     }
 
     if (!IsTribeLeaderOrAdminOnline(tribe_b))
     {
-        reason = "Target tribe leader/admin must be online.";
+        reason = L"Лидер/администратор целевого племени должен быть в сети.";
         return false;
     }
 
     if (IsTribeInCooldown(tribe_a, now) || IsTribeInCooldown(tribe_b, now))
     {
-        reason = "Cooldown is active.";
+        reason = L"Сейчас действует откат.";
         return false;
     }
 
@@ -717,9 +730,9 @@ void DeclareWar(int64_t tribe_a, int64_t tribe_b)
     }
     need_save.store(true);
 
-    const auto delay = FormatDuration(config.war_delay_seconds);
-    NotifyTribe(tribe_a, "War declared. Start in " + delay + ".");
-    NotifyTribe(tribe_b, "War declared against your tribe. Start in " + delay + ".");
+    const FString delay = FormatDuration(config.war_delay_seconds);
+    NotifyTribe(tribe_a, FString::Format(L"Война объявлена. Начало через {}.", *delay));
+    NotifyTribe(tribe_b, FString::Format(L"Вашему племени объявили войну. Начало через {}.", *delay));
     // Logging disabled to avoid crashes in early init
 }
 
@@ -744,8 +757,8 @@ void RequestCancelWar(int64_t tribe_id)
         other = tribe_id == war->tribe_a ? war->tribe_b : war->tribe_a;
     }
     need_save.store(true);
-    NotifyTribe(other, "Cancel war request received.");
-    NotifyTribe(tribe_id, "Cancel war request sent.");
+    NotifyTribe(other, L"Получен запрос на отмену войны. Чтобы отменить введите /accept");
+    NotifyTribe(tribe_id, L"Запрос на отмену войны отправлен.");
     // Logging disabled to avoid crashes in early init
 }
 
@@ -786,9 +799,9 @@ void AcceptCancelWar(int64_t tribe_id)
     if (!canceled)
         return;
 
-    const auto cooldown = FormatDuration(config.cooldown_seconds);
-    NotifyTribe(snapshot.tribe_a, "War canceled. Cooldown started (" + cooldown + ").");
-    NotifyTribe(snapshot.tribe_b, "War canceled. Cooldown started (" + cooldown + ").");
+    const FString cooldown = FormatDuration(config.cooldown_seconds);
+    NotifyTribe(snapshot.tribe_a, FString::Format(L"Война отменена. Начался откат ({}).", *cooldown));
+    NotifyTribe(snapshot.tribe_b, FString::Format(L"Война отменена. Начался откат ({}).", *cooldown));
     // Logging disabled to avoid crashes in early init
 }
 
@@ -806,9 +819,9 @@ bool HasIncomingCancel(int64_t tribe_id)
     return false;
 }
 
-std::vector<std::pair<int64_t, std::string>> ProcessTimers()
+std::vector<std::pair<int64_t, FString>> ProcessTimers()
 {
-    std::vector<std::pair<int64_t, std::string>> notifications_out;
+    std::vector<std::pair<int64_t, FString>> notifications_out;
     
     if (!auto_timers_enabled)
         return notifications_out;
@@ -840,8 +853,8 @@ std::vector<std::pair<int64_t, std::string>> ProcessTimers()
                     war.start_at = now + config.war_delay_seconds;
                 if (war.ended_at == 0 && now >= war.start_at && !war.start_notified)
                 {
-                    notifications_out.emplace_back(war.tribe_a, "War has started.");
-                    notifications_out.emplace_back(war.tribe_b, "War has started.");
+                    notifications_out.emplace_back(war.tribe_a, FString(L"Война началась."));
+                    notifications_out.emplace_back(war.tribe_b, FString(L"Война началась."));
                     war.start_notified = true;
                     changed = true;
 
@@ -869,8 +882,8 @@ std::vector<std::pair<int64_t, std::string>> ProcessTimers()
                 {
                     if (!war.cooldown_notified && now >= war.cooldown_end_a && now >= war.cooldown_end_b)
                     {
-                        notifications_out.emplace_back(war.tribe_a, "Cooldown ended.");
-                        notifications_out.emplace_back(war.tribe_b, "Cooldown ended.");
+                        notifications_out.emplace_back(war.tribe_a, FString(L"Откат закончился."));
+                        notifications_out.emplace_back(war.tribe_b, FString(L"Откат закончился."));
                         war.cooldown_notified = true;
                         changed = true;
 
@@ -913,7 +926,7 @@ std::vector<std::pair<int64_t, std::string>> ProcessTimers()
     return notifications_out;
 }
 
-void EnqueueNotifications(const std::vector<std::pair<int64_t, std::string>>& notes)
+void EnqueueNotifications(const std::vector<std::pair<int64_t, FString>>& notes)
 {
     if (notes.empty())
         return;
@@ -923,7 +936,7 @@ void EnqueueNotifications(const std::vector<std::pair<int64_t, std::string>>& no
 
 void FlushNotificationQueue()
 {
-    std::vector<std::pair<int64_t, std::string>> local;
+    std::vector<std::pair<int64_t, FString>> local;
     {
         DataLockGuard lock(notification_mutex);
         if (pending_notifications.empty())
@@ -963,8 +976,9 @@ std::vector<WarRecord> GetActiveWarsSnapshot(int64_t now)
     return result;
 }
 
-bool IsStructureDamageAllowed(APrimalStructure* structure, AController* instigator, AActor* causer)
+bool IsStructureDamageAllowed(APrimalStructure* structure, AController* instigator, AActor* causer, float& out_multiplier)
 {
+    out_multiplier = 1.0f;
     if (!structure)
         return true;
 
@@ -1012,6 +1026,7 @@ bool IsStructureDamageAllowed(APrimalStructure* structure, AController* instigat
 
         if ((attacker_side_a && target_side_b) || (attacker_side_b && target_side_a))
         {
+            out_multiplier = config.structure_damage_multiplier;
             // Log::GetLog()->debug("[TribeWarSystem] Structure damage ALLOWED: War #{}, Attacker tribe {} vs Target tribe {}", war.war_id, attacker_tribe, target_tribe);
             return true;
         }
@@ -1024,17 +1039,18 @@ bool IsStructureDamageAllowed(APrimalStructure* structure, AController* instigat
 FString GetStatusText(const WarRecord* war, int64_t tribe_id)
 {
     if (!war)
-        return FString("No war.");
+        return FString(L"Войны нет.");
 
     const auto now = Now();
     const auto phase = GetPhase(*war, now);
     if (phase == WarPhase::Pending)
     {
         const auto remain = std::max<int64_t>(0, war->start_at - now);
-        return FString::Format("Waiting for start: {}", FormatDuration(remain).c_str());
+        const FString remain_text = FormatDuration(remain);
+        return FString::Format(L"Ожидание начала: {}", *remain_text);
     }
     if (phase == WarPhase::Active)
-        return FString("War active.");
+        return FString(L"Война активна.");
     if (phase == WarPhase::Cooldown)
     {
         int64_t end = 0;
@@ -1043,10 +1059,11 @@ FString GetStatusText(const WarRecord* war, int64_t tribe_id)
         else if (tribe_id == war->tribe_b)
             end = war->cooldown_end_b;
         const auto remain = std::max<int64_t>(0, end - now);
-        return FString::Format("Cooldown: {}", FormatDuration(remain).c_str());
+        const FString remain_text = FormatDuration(remain);
+        return FString::Format(L"Откат: {}", *remain_text);
     }
 
-    return FString("No war.");
+    return FString(L"Войны нет.");
 }
 
 uint64_t GetPlayerKey(AShooterPlayerController* pc)
@@ -1068,11 +1085,13 @@ void HandleMenuAction(AShooterPlayerController* pc, int entry_id)
         return;
 
     const auto now = Now();
+    const auto player_key = GetPlayerKey(pc);
 
+    // Check radial menu constants first (backward compat)
     if (entry_id == kMenuStatusId || entry_id == kMuStatusId)
     {
         const auto war = GetWarForTribeCopy(tribe_id);
-        SendPlayerMessage(pc, GetStatusText(war ? &(*war) : nullptr, tribe_id).ToString());
+        SendPlayerMessage(pc, GetStatusText(war ? &(*war) : nullptr, tribe_id));
         return;
     }
 
@@ -1080,7 +1099,7 @@ void HandleMenuAction(AShooterPlayerController* pc, int entry_id)
     {
         if (!GetWarForTribeCopy(tribe_id).has_value())
         {
-            SendPlayerMessage(pc, "No active war.");
+            SendPlayerMessage(pc, L"Нет активной войны.");
             return;
         }
         RequestCancelWar(tribe_id);
@@ -1091,12 +1110,12 @@ void HandleMenuAction(AShooterPlayerController* pc, int entry_id)
     {
         if (!GetWarForTribeCopy(tribe_id).has_value())
         {
-            SendPlayerMessage(pc, "No active war.");
+            SendPlayerMessage(pc, L"Нет активной войны.");
             return;
         }
         if (!HasIncomingCancel(tribe_id))
         {
-            SendPlayerMessage(pc, "No cancel request.");
+            SendPlayerMessage(pc, L"Нет запроса на отмену.");
             return;
         }
         AcceptCancelWar(tribe_id);
@@ -1104,12 +1123,8 @@ void HandleMenuAction(AShooterPlayerController* pc, int entry_id)
     }
 
     const bool is_radial_declare = (entry_id >= kMenuDeclareListBaseId && entry_id < kMenuDeclareListBaseId + kMenuDeclareListMax);
-    const bool is_mu_declare = (entry_id >= kMuDeclareListBaseId && entry_id < kMuDeclareListBaseId + kMenuDeclareListMax);
-    if (is_radial_declare || is_mu_declare)
+    if (is_radial_declare)
     {
-        const auto player_key = GetPlayerKey(pc);
-        if (player_key == 0)
-            return;
         auto target_it = declare_targets.find(player_key);
         if (target_it == declare_targets.end())
             return;
@@ -1117,7 +1132,7 @@ void HandleMenuAction(AShooterPlayerController* pc, int entry_id)
         if (entry_it == target_it->second.end())
             return;
         const auto target_id = entry_it->second;
-        std::string reason;
+        FString reason;
         if (!IsWarAllowed(tribe_id, target_id, now, reason))
         {
             SendPlayerMessage(pc, reason);
@@ -1125,6 +1140,63 @@ void HandleMenuAction(AShooterPlayerController* pc, int entry_id)
         }
         DeclareWar(tribe_id, target_id);
         return;
+    }
+
+    // Dynamic MultiUse: lookup action from multiuse_action_map
+    if (player_key == 0)
+        return;
+    auto action_it = multiuse_action_map.find(player_key);
+    if (action_it == multiuse_action_map.end())
+        return;
+    auto action_entry = action_it->second.find(entry_id);
+    if (action_entry == action_it->second.end())
+        return;
+
+    const int action = action_entry->second;
+    if (action == 1) // status
+    {
+        const auto war = GetWarForTribeCopy(tribe_id);
+        SendPlayerMessage(pc, GetStatusText(war ? &(*war) : nullptr, tribe_id));
+    }
+    else if (action == 2) // cancel
+    {
+        if (!GetWarForTribeCopy(tribe_id).has_value())
+        {
+            SendPlayerMessage(pc, L"Нет активной войны.");
+            return;
+        }
+        RequestCancelWar(tribe_id);
+    }
+    else if (action == 3) // accept_cancel
+    {
+        if (!GetWarForTribeCopy(tribe_id).has_value())
+        {
+            SendPlayerMessage(pc, L"Нет активной войны.");
+            return;
+        }
+        if (!HasIncomingCancel(tribe_id))
+        {
+            SendPlayerMessage(pc, L"Нет запроса на отмену.");
+            return;
+        }
+        AcceptCancelWar(tribe_id);
+    }
+    else if (action >= 100) // declare target
+    {
+        auto target_it = declare_targets.find(player_key);
+        if (target_it == declare_targets.end())
+            return;
+        auto entry_it = target_it->second.find(entry_id);
+        if (entry_it == target_it->second.end())
+            return;
+        const auto target_id = entry_it->second;
+        FString reason;
+        if (!IsWarAllowed(tribe_id, target_id, now, reason))
+        {
+            SendPlayerMessage(pc, reason);
+            return;
+        }
+        DeclareWar(tribe_id, target_id);
     }
 }
 
@@ -1138,8 +1210,8 @@ void BuildTribeWarMenu(AShooterPlayerController* pc, TArray<FTribeRadialMenuEntr
         return;
 
     FTribeRadialMenuEntry root;
-    root.EntryName = FString("Tribe War");
-    root.EntryDescription = FString("Manage tribe wars");
+    root.EntryName = FString(L"Mega Tribe War");
+    root.EntryDescription = FString(L"Управление войнами племён");
     root.EntryIcon = nullptr;
     root.EntryID = kMenuRootId;
     root.ParentID = 0;
@@ -1147,22 +1219,22 @@ void BuildTribeWarMenu(AShooterPlayerController* pc, TArray<FTribeRadialMenuEntr
     entries->Add(root);
 
     FTribeRadialMenuEntry declare;
-    declare.EntryName = FString("Declare War");
-    declare.EntryDescription = FString("Declare war on a tribe");
+    declare.EntryName = FString(L"Объявить войну");
+    declare.EntryDescription = FString(L"Объявить войну племени");
     declare.EntryID = kMenuDeclareId;
     declare.ParentID = kMenuRootId;
     entries->Add(declare);
 
     FTribeRadialMenuEntry status;
-    status.EntryName = FString("War Status");
-    status.EntryDescription = FString("Show war status");
+    status.EntryName = FString(L"Статус войны");
+    status.EntryDescription = FString(L"Показать статус войны");
     status.EntryID = kMenuStatusId;
     status.ParentID = kMenuRootId;
     entries->Add(status);
 
     FTribeRadialMenuEntry cancel;
-    cancel.EntryName = FString("Cancel War");
-    cancel.EntryDescription = FString("Request cancel");
+    cancel.EntryName = FString(L"Отменить войну");
+    cancel.EntryDescription = FString(L"Запросить отмену");
     cancel.EntryID = kMenuCancelId;
     cancel.ParentID = kMenuRootId;
     entries->Add(cancel);
@@ -1170,8 +1242,8 @@ void BuildTribeWarMenu(AShooterPlayerController* pc, TArray<FTribeRadialMenuEntr
     if (HasIncomingCancel(GetTribeIdFromPlayer(pc)))
     {
         FTribeRadialMenuEntry accept;
-        accept.EntryName = FString("Accept Cancel");
-        accept.EntryDescription = FString("Accept cancel request");
+        accept.EntryName = FString(L"Принять отмену");
+        accept.EntryDescription = FString(L"Принять запрос на отмену");
         accept.EntryID = kMenuAcceptCancelId;
         accept.ParentID = kMenuRootId;
         entries->Add(accept);
@@ -1214,7 +1286,7 @@ void BuildDeclareListMenu(AShooterPlayerController* pc, TArray<FTribeRadialMenuE
 
         FTribeRadialMenuEntry item;
         item.EntryName = data.TribeNameField();
-        item.EntryDescription = FString("Declare war");
+        item.EntryDescription = FString(L"Объявить войну");
         item.EntryID = kMenuDeclareListBaseId + list_count;
         item.ParentID = kMenuDeclareId;
         entries->Add(item);
@@ -1226,18 +1298,61 @@ void BuildDeclareListMenu(AShooterPlayerController* pc, TArray<FTribeRadialMenuE
 
 // === MultiUse wheel integration (server-side radial) ===
 
+static void DumpMultiUseEntries(const char* prefix, const TArray<FMultiUseEntry>* entries)
+{
+    if (!config.debug_multiuse_log)
+        return;
+    if (!entries)
+        return;
+
+    const int count = entries->Num();
+    AppendMultiUseDebugLog(std::string(prefix) + ": count=" + std::to_string(count));
+
+    const int limit = (std::min)(count, 40);
+    for (int i = 0; i < limit; ++i)
+    {
+        const auto& e = (*entries)[i];
+        AppendMultiUseDebugLog(
+            std::string(prefix) + " [" + std::to_string(i) + "]" +
+            " idx=" + std::to_string(e.UseIndex) +
+            " prio=" + std::to_string(e.Priority) +
+            " cat=" + std::to_string(e.WheelCategory) +
+            " hideUI=" + std::to_string(static_cast<int>(e.bHideFromUI)) +
+            " disable=" + std::to_string(static_cast<int>(e.bDisableUse)) +
+            " inv=" + std::to_string(static_cast<int>(e.bDisplayOnInventoryUI)) +
+            " inv2=" + std::to_string(static_cast<int>(e.bDisplayOnInventoryUISecondary)) +
+            " inv3=" + std::to_string(static_cast<int>(e.bDisplayOnInventoryUITertiary)) +
+            " sec=" + std::to_string(static_cast<int>(e.bIsSecondaryUse)) +
+            " clientOnly=" + std::to_string(static_cast<int>(e.bClientSideOnly)));
+    }
+
+    if (count > limit)
+        AppendMultiUseDebugLog(std::string(prefix) + ": (truncated, total=" + std::to_string(count) + ")");
+}
+
 static void AddMultiUseEntry(TArray<FMultiUseEntry>* entries, int use_index, const FString& text, int priority = 0)
 {
     if (!entries)
         return;
-    FMultiUseEntry e{};
-    e.UseIndex = use_index;
+    FMultiUseEntry e;
+    memset(&e, 0, sizeof(e));
+    e.ForComponent = nullptr; // CRITICAL: must be valid pointer or nullptr
     e.UseString = text;
+    e.UseIndex = use_index;
     e.Priority = priority;
+    e.bHideFromUI = 0;
+    e.bDisableUse = 0;
+    e.WheelCategory = 0;
+    e.DisableUseColor = FColor(0, 0, 0, 0);
+    e.UseTextColor = FColor(255, 255, 255, 255);
+    e.EntryActivationTimer = 0.0f;
+    e.DefaultEntryActivationTimer = 0.0f;
+    e.ActivationSound = nullptr;
+    e.UseInventoryButtonStyleOverrideIndex = 0;
     entries->Add(e);
 }
 
-static void BuildDeclareListMultiUse(AShooterPlayerController* pc, int64_t tribe_id, TArray<FMultiUseEntry>* entries)
+static void BuildDeclareListMultiUse(AShooterPlayerController* pc, int64_t tribe_id, TArray<FMultiUseEntry>* entries, int& next_index)
 {
     if (!pc || !entries)
         return;
@@ -1273,10 +1388,11 @@ static void BuildDeclareListMultiUse(AShooterPlayerController* pc, int64_t tribe
         if (GetWarForTribeCopy(data.TribeIDField()).has_value() || IsTribeInCooldown(data.TribeIDField(), now))
             continue;
 
-        const int entry_id = kMuDeclareListBaseId + list_count;
-        const auto label = FString::Format("Declare war: {}", data.TribeNameField().ToString().c_str());
+        const int entry_id = next_index++;
+        const auto label = FString::Format(L"Объявить войну: {}", *data.TribeNameField());
         AddMultiUseEntry(entries, entry_id, label);
         declare_targets[player_key][entry_id] = data.TribeIDField();
+        multiuse_action_map[player_key][entry_id] = 100 + list_count; // action=declare target #N
         ++list_count;
     }
 }
@@ -1320,13 +1436,52 @@ static void MaybeAddMultiUseMenu(APrimalStructure* structure, APlayerController*
     }
 
     const int before = entries->Num();
-    AddMultiUseEntry(entries, kMuStatusId, FString("Tribe War: Status"), 10);
-    AddMultiUseEntry(entries, kMuCancelId, FString("Tribe War: Cancel"), 10);
-    if (HasIncomingCancel(tribe_id))
-        AddMultiUseEntry(entries, kMuAcceptCancelId, FString("Tribe War: Accept Cancel"), 10);
 
-    BuildDeclareListMultiUse(pc, tribe_id, entries);
+    DumpMultiUseEntries((std::string(hook_name) + ": before").c_str(), entries);
+
+    const auto player_key = GetPlayerKey(pc);
+    if (player_key == 0)
+        return;
+
+    // Clear previous mappings for this player
+    multiuse_action_map[player_key].clear();
+
+    // Find max UseIndex in existing entries to avoid conflicts
+    int max_index = 0;
+    for (int i = 0; i < before; ++i)
+    {
+        const int idx = (*entries)[i].UseIndex;
+        if (idx > max_index)
+            max_index = idx;
+    }
+    // Start adding from max+1 (or minimum 100 if no entries exist)
+    int next_index = (std::max)(max_index + 1, 100);
+
+    // Always add Status (always valid)
+    const int status_idx = next_index++;
+    AddMultiUseEntry(entries, status_idx, FString(L"Mega Tribe War: Статус"), 10);
+    multiuse_action_map[player_key][status_idx] = 1; // action=status
+
+    // Cancel and Accept only if war is active
+    const auto war = GetWarForTribeCopy(tribe_id);
+    if (war.has_value())
+    {
+        const int cancel_idx = next_index++;
+        AddMultiUseEntry(entries, cancel_idx, FString(L"Mega Tribe War: Отмена"), 10);
+        multiuse_action_map[player_key][cancel_idx] = 2; // action=cancel
+
+        if (HasIncomingCancel(tribe_id))
+        {
+            const int accept_idx = next_index++;
+            AddMultiUseEntry(entries, accept_idx, FString(L"Mega Tribe War: Принять отмену"), 10);
+            multiuse_action_map[player_key][accept_idx] = 3; // action=accept_cancel
+        }
+    }
+
+    BuildDeclareListMultiUse(pc, tribe_id, entries, next_index);
     const int after = entries->Num();
+
+    DumpMultiUseEntries((std::string(hook_name) + ": after").c_str(), entries);
 
     AppendMultiUseDebugLog(std::string(hook_name) + ": added entries before=" + std::to_string(before) + " after=" + std::to_string(after) +
                            " tribe_id=" + std::to_string(tribe_id) + " leader=" + std::string(is_leader ? "1" : "0") +
@@ -1342,10 +1497,12 @@ static bool MaybeHandleMultiUse(APrimalStructure* structure, APlayerController* 
     if (!for_pc)
         return false;
 
-        if (!(use_index == kMenuStatusId || use_index == kMenuCancelId || use_index == kMenuAcceptCancelId ||
-            use_index == kMuStatusId || use_index == kMuCancelId || use_index == kMuAcceptCancelId ||
-            (use_index >= kMuDeclareListBaseId && use_index < kMuDeclareListBaseId + kMenuDeclareListMax) ||
-            (use_index >= kMenuDeclareListBaseId && use_index < kMenuDeclareListBaseId + kMenuDeclareListMax)))
+// Check if this use_index belongs to our plugin (via action_map or radial constants)
+    const auto player_key = GetPlayerKey(static_cast<AShooterPlayerController*>(for_pc));
+    const bool is_our_multiuse = (player_key != 0 && multiuse_action_map.count(player_key) && multiuse_action_map[player_key].count(use_index));
+    const bool is_radial_action = (use_index == kMenuStatusId || use_index == kMenuCancelId || use_index == kMenuAcceptCancelId ||
+                                   (use_index >= kMenuDeclareListBaseId && use_index < kMenuDeclareListBaseId + kMenuDeclareListMax));
+    if (!is_our_multiuse && !is_radial_action)
         return false;
 
     auto* pc = static_cast<AShooterPlayerController*>(for_pc);
@@ -1461,10 +1618,12 @@ float Hook_APrimalStructure_TakeDamage(APrimalStructure* structure, float damage
     if (damage <= 0.0f)
         return APrimalStructure_TakeDamage_original(structure, damage, event, instigator, causer);
 
-    if (!IsStructureDamageAllowed(structure, instigator, causer))
+    float mult = 1.0f;
+    if (!IsStructureDamageAllowed(structure, instigator, causer, mult))
         return 0.0f;
 
-    return APrimalStructure_TakeDamage_original(structure, damage, event, instigator, causer);
+    mult = (std::max)(0.0f, (std::min)(mult, 10.0f));
+    return APrimalStructure_TakeDamage_original(structure, damage * mult, event, instigator, causer);
 }
 
 #if TRIBEWAR_ENABLE_RADIAL
@@ -1495,18 +1654,18 @@ void CmdWarStatus(AShooterPlayerController* pc, FString*, EChatSendMode::Type)
     const auto tribe_id = GetTribeIdFromPlayer(pc);
     if (tribe_id == 0)
     {
-        SendPlayerMessage(pc, "You must be in a tribe.");
+        SendPlayerMessage(pc, L"Вы должны состоять в племени.");
         return;
     }
 
     if (!IsTribeLeaderOrAdmin(pc))
     {
-        SendPlayerMessage(pc, "Only tribe leader/admin can use this command.");
+        SendPlayerMessage(pc, L"Только лидер/администратор племени может использовать эту команду.");
         return;
     }
 
     const auto war = GetWarForTribeCopy(tribe_id);
-    const auto status = GetStatusText(war ? &(*war) : nullptr, tribe_id).ToString();
+    const FString status = GetStatusText(war ? &(*war) : nullptr, tribe_id);
     SendPlayerMessage(pc, status);
 }
 
@@ -1518,20 +1677,20 @@ void CmdWarDeclare(AShooterPlayerController* pc, FString*, EChatSendMode::Type)
     const auto tribe_id = GetTribeIdFromPlayer(pc);
     if (tribe_id == 0)
     {
-        SendPlayerMessage(pc, "You must be in a tribe.");
+        SendPlayerMessage(pc, L"Вы должны состоять в племени.");
         return;
     }
 
     if (!IsTribeLeaderOrAdmin(pc))
     {
-        SendPlayerMessage(pc, "Only tribe leader/admin can use this command.");
+        SendPlayerMessage(pc, L"Только лидер/администратор племени может использовать эту команду.");
         return;
     }
 
     const auto now = Now();
     if (GetWarForTribeCopy(tribe_id).has_value() || IsTribeInCooldown(tribe_id, now))
     {
-        SendPlayerMessage(pc, "Your tribe already has an active war or cooldown.");
+        SendPlayerMessage(pc, L"У вашего племени уже есть активная война или откат.");
         return;
     }
 
@@ -1539,7 +1698,7 @@ void CmdWarDeclare(AShooterPlayerController* pc, FString*, EChatSendMode::Type)
     if (!game_mode)
         return;
 
-    std::string message = "Available tribes to declare war:\\n";
+    FString message(L"Доступные племена для объявления войны:\n");
     int count = 0;
     const auto& tribes = game_mode->TribesDataField();
     for (int i = 0; i < tribes.Num(); ++i)
@@ -1552,17 +1711,17 @@ void CmdWarDeclare(AShooterPlayerController* pc, FString*, EChatSendMode::Type)
         if (GetWarForTribeCopy(data.TribeIDField()).has_value() || IsTribeInCooldown(data.TribeIDField(), now))
             continue;
 
-        message += data.TribeNameField().ToString() + " (ID: " + std::to_string(data.TribeIDField()) + ")\\n";
+        message += FString::Format(L"{} (ID: {})\n", *data.TribeNameField(), data.TribeIDField());
         count++;
     }
 
     if (count == 0)
     {
-        SendPlayerMessage(pc, "No tribes available for war declaration.");
+        SendPlayerMessage(pc, L"Нет доступных племён для объявления войны.");
         return;
     }
 
-    message += "\\nUse /war declare <tribe_id> to declare war.";
+    message += L"\nИспользуйте /war <tribe_id>, чтобы объявить войну.";
     SendPlayerMessage(pc, message);
 }
 
@@ -1574,37 +1733,42 @@ void CmdWarDeclareId(AShooterPlayerController* pc, FString* message, EChatSendMo
     const auto tribe_id = GetTribeIdFromPlayer(pc);
     if (tribe_id == 0)
     {
-        SendPlayerMessage(pc, "You must be in a tribe.");
+        SendPlayerMessage(pc, L"Вы должны состоять в племени.");
         return;
     }
 
     if (!IsTribeLeaderOrAdmin(pc))
     {
-        SendPlayerMessage(pc, "Only tribe leader/admin can use this command.");
+        SendPlayerMessage(pc, L"Только лидер/администратор племени может использовать эту команду.");
         return;
     }
 
     TArray<FString> parsed;
     message->ParseIntoArray(parsed, L" ", true);
-    if (parsed.Num() < 3)
+    // expected: "/war <tribe_id>" or "<tribe_id>" depending on chat hook
+    int arg_index = 0;
+    if (parsed.Num() >= 1 && parsed[0].StartsWith(L"/"))
+        arg_index = 1;
+
+    if (parsed.Num() <= arg_index)
     {
-        SendPlayerMessage(pc, "Usage: /war declare <tribe_id>");
+        SendPlayerMessage(pc, L"Использование: /war <tribe_id>");
         return;
     }
 
     int64_t target_id = 0;
     try
     {
-        target_id = std::stoll(parsed[2].ToString());
+        target_id = std::stoll(parsed[arg_index].ToString());
     }
     catch (...)
     {
-        SendPlayerMessage(pc, "Invalid tribe ID.");
+        SendPlayerMessage(pc, L"Некорректный ID племени.");
         return;
     }
 
     const auto now = Now();
-    std::string reason;
+    FString reason;
     if (!IsWarAllowed(tribe_id, target_id, now, reason))
     {
         SendPlayerMessage(pc, reason);
@@ -1622,19 +1786,19 @@ void CmdWarCancel(AShooterPlayerController* pc, FString*, EChatSendMode::Type)
     const auto tribe_id = GetTribeIdFromPlayer(pc);
     if (tribe_id == 0)
     {
-        SendPlayerMessage(pc, "You must be in a tribe.");
+        SendPlayerMessage(pc, L"Вы должны состоять в племени.");
         return;
     }
 
     if (!IsTribeLeaderOrAdmin(pc))
     {
-        SendPlayerMessage(pc, "Only tribe leader/admin can use this command.");
+        SendPlayerMessage(pc, L"Только лидер/администратор племени может использовать эту команду.");
         return;
     }
 
     if (!GetWarForTribeCopy(tribe_id).has_value())
     {
-        SendPlayerMessage(pc, "No active war.");
+        SendPlayerMessage(pc, L"Нет активной войны.");
         return;
     }
 
@@ -1649,25 +1813,25 @@ void CmdWarAcceptCancel(AShooterPlayerController* pc, FString*, EChatSendMode::T
     const auto tribe_id = GetTribeIdFromPlayer(pc);
     if (tribe_id == 0)
     {
-        SendPlayerMessage(pc, "You must be in a tribe.");
+        SendPlayerMessage(pc, L"Вы должны состоять в племени.");
         return;
     }
 
     if (!IsTribeLeaderOrAdmin(pc))
     {
-        SendPlayerMessage(pc, "Only tribe leader/admin can use this command.");
+        SendPlayerMessage(pc, L"Только лидер/администратор племени может использовать эту команду.");
         return;
     }
 
     if (!GetWarForTribeCopy(tribe_id).has_value())
     {
-        SendPlayerMessage(pc, "No active war.");
+        SendPlayerMessage(pc, L"Нет активной войны.");
         return;
     }
 
     if (!HasIncomingCancel(tribe_id))
     {
-        SendPlayerMessage(pc, "No cancel request received.");
+        SendPlayerMessage(pc, L"Запрос на отмену не получен.");
         return;
     }
 
@@ -1679,49 +1843,56 @@ void CmdWarHelp(AShooterPlayerController* pc, FString*, EChatSendMode::Type)
     if (!pc)
         return;
 
-    std::string help = "=== Tribe War System Commands ===\\n";
-    help += "/war status - Show current war status\\n";
-    help += "/war declare - List available tribes to declare war\\n";
-    help += "/war declare <tribe_id> - Declare war on specific tribe\\n";
-    help += "/war cancel - Request war cancellation\\n";
-    help += "/war accept - Accept cancellation request\\n";
+    FString help(L"Краткая справка по командам:\n");
+    help += L"/info - краткая справка по командам\n";
+    help += L"/status - статус текущей войны\n";
+    help += L"/war - список доступных племён для объявления\n";
+    help += L"/war <tribe_id> - объявить войну выбранному племени\n";
+    help += L"/stop - запросить отмену войны\n";
+    help += L"/accept - принять запрос на отмену\n";
     SendPlayerMessage(pc, help);
 }
 
 void CmdWar(AShooterPlayerController* pc, FString* message, EChatSendMode::Type mode)
 {
+    if (!pc)
+        return;
+
+    // /war => list; /war <tribe_id> => declare
     if (!message)
     {
-        CmdWarHelp(pc, message, mode);
+        CmdWarDeclare(pc, message, mode);
         return;
     }
 
     TArray<FString> parsed;
     message->ParseIntoArray(parsed, L" ", true);
 
-    if (parsed.Num() < 2)
+    if (parsed.Num() <= 1)
     {
-        CmdWarHelp(pc, message, mode);
+        CmdWarDeclare(pc, message, mode);
         return;
     }
 
-    const FString& subcommand = parsed[1];
-    
-    if (subcommand.Equals("status", ESearchCase::IgnoreCase))
-        CmdWarStatus(pc, message, mode);
-    else if (subcommand.Equals("declare", ESearchCase::IgnoreCase))
+    // Try to support both message formats:
+    // 1) "/war 123"  => parsed[0]="/war", parsed[1]="123"
+    // 2) "123"       => parsed[0]="123"
+    int arg_index = 0;
+    if (parsed[0].StartsWith(L"/"))
+        arg_index = 1;
+
+    if (parsed.Num() <= arg_index)
     {
-        if (parsed.Num() >= 3)
-            CmdWarDeclareId(pc, message, mode);
-        else
-            CmdWarDeclare(pc, message, mode);
+        CmdWarDeclare(pc, message, mode);
+        return;
     }
-    else if (subcommand.Equals("cancel", ESearchCase::IgnoreCase))
-        CmdWarCancel(pc, message, mode);
-    else if (subcommand.Equals("accept", ESearchCase::IgnoreCase))
-        CmdWarAcceptCancel(pc, message, mode);
+
+    // If the next token looks like a number, treat it as tribe_id; otherwise list.
+    const FString& arg = parsed[arg_index];
+    if (arg.IsNumeric())
+        CmdWarDeclareId(pc, message, mode);
     else
-        CmdWarHelp(pc, message, mode);
+        CmdWarDeclare(pc, message, mode);
 }
 
 #endif // TRIBEWAR_ENABLE_CHAT_COMMANDS
@@ -1781,6 +1952,17 @@ void Load()
         ArkApi::GetHooks().SetHook("AShooterGameMode.Tick", &Hook_AShooterGameMode_Tick, &AShooterGameMode_Tick_original);
         ArkApi::GetHooks().SetHook("APrimalStructure.TakeDamage", &Hook_APrimalStructure_TakeDamage, &APrimalStructure_TakeDamage_original);
 
+#if TRIBEWAR_ENABLE_CHAT_COMMANDS
+        ArkApi::GetCommands().AddChatCommand("/info", &CmdWarHelp);
+        ArkApi::GetCommands().AddChatCommand("/status", &CmdWarStatus);
+        ArkApi::GetCommands().AddChatCommand("/war", &CmdWar);
+        ArkApi::GetCommands().AddChatCommand("/stop", &CmdWarCancel);
+        ArkApi::GetCommands().AddChatCommand("/accept", &CmdWarAcceptCancel);
+#endif
+
+        // MultiUse hooks disabled due to FMultiUseEntry structure incompatibility with ARK 361.7
+        // Use chat commands instead: /info, /status, /war, /stop, /accept
+        /*
         set_hook_logged("APrimalStructure.GetMultiUseEntries", &Hook_APrimalStructure_GetMultiUseEntries, &APrimalStructure_GetMultiUseEntries_original);
         set_hook_logged("APrimalStructure.TryMultiUse", &Hook_APrimalStructure_TryMultiUse, &APrimalStructure_TryMultiUse_original);
         set_hook_logged("APrimalStructure.BPGetMultiUseEntries", &Hook_APrimalStructure_BPGetMultiUseEntries, &APrimalStructure_BPGetMultiUseEntries_original);
@@ -1790,6 +1972,7 @@ void Load()
         set_hook_logged("APrimalStructureItemContainer.TryMultiUse", &Hook_APrimalStructureItemContainer_TryMultiUse, &APrimalStructureItemContainer_TryMultiUse_original);
         set_hook_logged("APrimalStructureItemContainer.BPGetMultiUseEntries", &Hook_APrimalStructureItemContainer_BPGetMultiUseEntries, &APrimalStructureItemContainer_BPGetMultiUseEntries_original);
         set_hook_logged("APrimalStructureItemContainer.BPTryMultiUse", &Hook_APrimalStructureItemContainer_BPTryMultiUse, &APrimalStructureItemContainer_BPTryMultiUse_original);
+        */
         
 #if TRIBEWAR_ENABLE_RADIAL
         ArkApi::GetHooks().SetHook("AShooterPlayerController.GetTribeRadialMenuEntries", &Hook_AShooterPlayerController_GetTribeRadialMenuEntries, &AShooterPlayerController_GetTribeRadialMenuEntries_original);
@@ -1811,11 +1994,21 @@ void Unload()
             SaveData();
         }
 
+#if TRIBEWAR_ENABLE_CHAT_COMMANDS
+        ArkApi::GetCommands().RemoveChatCommand("/info");
+        ArkApi::GetCommands().RemoveChatCommand("/status");
+        ArkApi::GetCommands().RemoveChatCommand("/war");
+        ArkApi::GetCommands().RemoveChatCommand("/stop");
+        ArkApi::GetCommands().RemoveChatCommand("/accept");
+#endif
+
         ArkApi::GetCommands().RemoveOnTimerCallback("TribeWarSystem_Timer");
         
         ArkApi::GetHooks().DisableHook("AShooterGameMode.Tick", &Hook_AShooterGameMode_Tick);
         ArkApi::GetHooks().DisableHook("APrimalStructure.TakeDamage", &Hook_APrimalStructure_TakeDamage);
-
+// MultiUse hooks were disabled (see Load())
+        /*
+        
         ArkApi::GetHooks().DisableHook("APrimalStructure.GetMultiUseEntries", &Hook_APrimalStructure_GetMultiUseEntries);
         ArkApi::GetHooks().DisableHook("APrimalStructure.TryMultiUse", &Hook_APrimalStructure_TryMultiUse);
 
@@ -1823,11 +2016,10 @@ void Unload()
         ArkApi::GetHooks().DisableHook("APrimalStructure.BPTryMultiUse", &Hook_APrimalStructure_BPTryMultiUse);
 
         ArkApi::GetHooks().DisableHook("APrimalStructureItemContainer.GetMultiUseEntries", &Hook_APrimalStructureItemContainer_GetMultiUseEntries);
-        ArkApi::GetHooks().DisableHook("APrimalStructureItemContainer.TryMultiUse", &Hook_APrimalStructureItemContainer_TryMultiUse);
-
         ArkApi::GetHooks().DisableHook("APrimalStructureItemContainer.BPGetMultiUseEntries", &Hook_APrimalStructureItemContainer_BPGetMultiUseEntries);
         ArkApi::GetHooks().DisableHook("APrimalStructureItemContainer.BPTryMultiUse", &Hook_APrimalStructureItemContainer_BPTryMultiUse);
-        
+        */
+
 #if TRIBEWAR_ENABLE_RADIAL
         ArkApi::GetHooks().DisableHook("AShooterPlayerController.GetTribeRadialMenuEntries", &Hook_AShooterPlayerController_GetTribeRadialMenuEntries);
         ArkApi::GetHooks().DisableHook("AShooterPlayerController.OnTribeRadialMenuSelection", &Hook_AShooterPlayerController_OnTribeRadialMenuSelection);
