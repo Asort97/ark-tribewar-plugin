@@ -6,12 +6,14 @@
 #include <Windows.h>
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <fstream>
 #include <mutex>
 #include <optional>
 #include <atomic>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "json.hpp"
@@ -63,6 +65,13 @@ struct Config
     // Applied only when damage is allowed because of an active war (opposing sides).
     // 1.0 = normal damage, 0.5 = half damage, 0.0 = no structure damage during war.
     float structure_damage_multiplier = 1.0f;
+    std::vector<std::string> excluded_structure_blueprints;
+
+    // Abandoned tribes (tribe deleted / zero members)
+    // If a tribe has zero members, its structures become attackable by anyone for this duration.
+    bool enable_abandoned_structure_window = false;
+    int32_t abandoned_structure_window_seconds = 12 * 60 * 60;
+    float abandoned_structure_damage_multiplier = 1.0f;
 
     // UI integration
     // enable_multiuse_menu: adds actions to the existing MultiUse wheel (server-side, no client mod).
@@ -139,6 +148,9 @@ Config config;
 std::unordered_map<int64_t, WarRecord> wars_by_id;
 std::unordered_map<int64_t, int64_t> tribe_to_war_id;
 std::unordered_map<uint64_t, std::unordered_map<int, int64_t>> declare_targets;
+std::unordered_map<int64_t, int64_t> abandoned_tribe_until; // tribe_id -> unix_ts
+std::unordered_map<int64_t, FString> tribe_name_cache;
+std::atomic<bool> tribe_name_dirty { false };
 
 // Dynamic UseIndex mapping: for each player, store what UseIndex maps to what action.
 // action codes: 1=status, 2=cancel, 3=accept_cancel, 100+N=declare_target[N]
@@ -148,7 +160,17 @@ int64_t next_war_id = 1;
 bool auto_timers_enabled = true;
 bool plugin_initialized = false;
 std::atomic<bool> need_save { false };
-std::vector<std::pair<int64_t, FString>> pending_notifications;
+struct PendingNotification
+{
+    int64_t side_tribe_id = 0;
+    FString message;
+    bool styled = false;
+    FLinearColor color = FLinearColor(1.0f, 0.85f, 0.1f, 1.0f);
+    float scale = 1.0f;
+    float time = 6.0f;
+};
+
+std::vector<PendingNotification> pending_notifications;
 DataMutex notification_mutex;
 
 
@@ -167,6 +189,71 @@ std::string GetDataPath()
     return GetPluginDir() + "/data.json";
 }
 
+std::string GetTribeNameCachePath()
+{
+    return GetPluginDir() + "/tribe_names.json";
+}
+
+AShooterPlayerState* GetPlayerState(AShooterPlayerController* pc);
+int64_t CanonicalTribeId(int64_t raw_id);
+int64_t GetTribeIdFromPlayer(AShooterPlayerController* pc);
+bool TryGetPathNameSafe(UObject* obj, FString* out_path);
+bool TryGetTribeNameSafe(FTribeData* data, FString* out_name);
+int32_t TryGetTribeMemberCount(FTribeData& data, int32_t& out_tribe_id);
+
+std::string ToLowerAscii(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
+}
+
+std::string NormalizeBlueprintPath(const std::string& path)
+{
+    std::string lower = ToLowerAscii(path);
+    const std::string prefix = "blueprint'";
+    if (lower.rfind(prefix, 0) == 0)
+        lower = lower.substr(prefix.size());
+    if (!lower.empty() && lower.back() == '\'')
+        lower.pop_back();
+    return lower;
+}
+
+bool TryGetPathNameSafe(UObject* obj, FString* out_path)
+{
+    if (!obj || !out_path)
+        return false;
+
+    if (!obj->IsValidLowLevelFast(true))
+        return false;
+
+    __try
+    {
+        obj->GetPathName(out_path, nullptr);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+bool TryGetTribeNameSafe(FTribeData* data, FString* out_name)
+{
+    if (!data || !out_name)
+        return false;
+
+    __try
+    {
+        *out_name = data->TribeNameField();
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
 std::string GetSelfTestLogPath()
 {
     return GetPluginDir() + "/self_test.log";
@@ -181,6 +268,265 @@ bool FileExists(const std::string& path)
 {
     std::error_code ec;
     return std::filesystem::exists(std::filesystem::path(path), ec);
+}
+
+void LoadTribeNameCache()
+{
+    try
+    {
+        if (!FileExists(GetTribeNameCachePath()))
+            return;
+
+        std::ifstream file(GetTribeNameCachePath(), std::ios::in | std::ios::binary);
+        if (!file.is_open())
+            return;
+
+        const std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        const auto json = nlohmann::json::parse(content, nullptr, false);
+        if (json.is_discarded())
+            return;
+
+        if (json.find("names") == json.end() || !json["names"].is_object())
+            return;
+
+        DataLockGuard lock(data_mutex);
+        tribe_name_cache.clear();
+        for (auto it = json["names"].begin(); it != json["names"].end(); ++it)
+        {
+            if (!it.value().is_string())
+                continue;
+            const int64_t id = CanonicalTribeId(std::stoll(it.key()));
+            tribe_name_cache[id] = FString(it.value().get<std::string>().c_str());
+        }
+    }
+    catch (...)
+    {
+        // ignore
+    }
+}
+
+void SaveTribeNameCache()
+{
+    if (!tribe_name_dirty.exchange(false))
+        return;
+
+    try
+    {
+        nlohmann::json json;
+        nlohmann::json names = nlohmann::json::object();
+        {
+            DataLockGuard lock(data_mutex);
+            for (const auto& it : tribe_name_cache)
+                names[std::to_string(it.first)] = it.second.ToString();
+        }
+        json["names"] = std::move(names);
+
+        std::filesystem::create_directories(std::filesystem::path(GetTribeNameCachePath()).parent_path());
+        std::ofstream file(GetTribeNameCachePath(), std::ios::trunc);
+        file << json.dump(2);
+    }
+    catch (...)
+    {
+        // ignore
+    }
+}
+
+FString GetCachedTribeName(int64_t tribe_id)
+{
+    tribe_id = CanonicalTribeId(tribe_id);
+    DataLockGuard lock(data_mutex);
+    auto it = tribe_name_cache.find(tribe_id);
+    if (it == tribe_name_cache.end())
+        return FString();
+    return it->second;
+}
+
+void CacheTribeName(int64_t tribe_id, const FString& name)
+{
+    if (name.IsEmpty())
+        return;
+
+    tribe_id = CanonicalTribeId(tribe_id);
+    bool updated = false;
+    {
+        DataLockGuard lock(data_mutex);
+        auto it = tribe_name_cache.find(tribe_id);
+        if (it == tribe_name_cache.end() || it->second != name)
+        {
+            tribe_name_cache[tribe_id] = name;
+            updated = true;
+        }
+    }
+
+    if (updated)
+        tribe_name_dirty.store(true);
+}
+
+bool TryResolveTribeName(int64_t tribe_id, FString& out_name)
+{
+    tribe_id = CanonicalTribeId(tribe_id);
+    if (tribe_id == 0)
+        return false;
+
+    out_name = GetCachedTribeName(tribe_id);
+    if (!out_name.IsEmpty())
+        return true;
+
+    if (ArkApi::GetApiUtils().GetStatus() == ArkApi::ServerStatus::Ready)
+    {
+        if (auto* world = ArkApi::GetApiUtils().GetWorld())
+        {
+            auto& players = world->PlayerControllerListField();
+            for (TWeakObjectPtr<APlayerController>& player : players)
+            {
+                auto* pc = static_cast<AShooterPlayerController*>(player.Get());
+                if (!pc || GetTribeIdFromPlayer(pc) != tribe_id)
+                    continue;
+
+                if (auto* ps = GetPlayerState(pc))
+                {
+                    if (auto* data = ps->MyTribeDataField())
+                        TryGetTribeNameSafe(data, &out_name);
+                }
+
+                if (out_name.IsEmpty())
+                {
+                    if (auto* ch = pc->GetPlayerCharacter())
+                        out_name = ch->TribeNameField();
+                }
+
+                if (!out_name.IsEmpty())
+                {
+                    CacheTribeName(tribe_id, out_name);
+                    return true;
+                }
+            }
+        }
+
+        if (auto* game_mode = ArkApi::GetApiUtils().GetShooterGameMode())
+        {
+            const auto& tribes = game_mode->TribesDataField();
+            for (int i = 0; i < tribes.Num(); ++i)
+            {
+                auto& data = const_cast<FTribeData&>(tribes[i]);
+                int32_t tid = 0;
+                if (TryGetTribeMemberCount(data, tid) < 0)
+                    continue;
+                if (CanonicalTribeId(static_cast<int64_t>(tid)) != tribe_id)
+                    continue;
+                TryGetTribeNameSafe(&data, &out_name);
+                if (!out_name.IsEmpty())
+                {
+                    CacheTribeName(tribe_id, out_name);
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+FString GetTribeDisplayName(int64_t tribe_id)
+{
+    FString name;
+    if (!TryResolveTribeName(tribe_id, name))
+        name = GetCachedTribeName(tribe_id);
+
+    if (!name.IsEmpty())
+    {
+        CacheTribeName(tribe_id, name);
+        return FString::Format(L"{} (ID: {})", *name, tribe_id);
+    }
+    return FString::Format(L"ID: {}", CanonicalTribeId(tribe_id));
+}
+
+void UpdateTribeNameCache()
+{
+    if (ArkApi::GetApiUtils().GetStatus() != ArkApi::ServerStatus::Ready)
+        return;
+
+    auto* world = ArkApi::GetApiUtils().GetWorld();
+    if (!world)
+        return;
+
+    auto* game_mode = ArkApi::GetApiUtils().GetShooterGameMode();
+
+    auto& players = world->PlayerControllerListField();
+    for (TWeakObjectPtr<APlayerController>& player : players)
+    {
+        auto* pc = static_cast<AShooterPlayerController*>(player.Get());
+        if (!pc)
+            continue;
+
+        const int64_t tribe_id = GetTribeIdFromPlayer(pc);
+        if (tribe_id == 0)
+            continue;
+
+        FString name;
+        if (auto* ps = GetPlayerState(pc))
+        {
+            if (auto* data = ps->MyTribeDataField())
+                TryGetTribeNameSafe(data, &name);
+        }
+
+        if (name.IsEmpty())
+        {
+            auto* ch = pc->GetPlayerCharacter();
+            if (ch)
+                name = ch->TribeNameField();
+        }
+
+        if (name.IsEmpty())
+            continue;
+
+        bool updated = false;
+        {
+            DataLockGuard lock(data_mutex);
+            auto it = tribe_name_cache.find(tribe_id);
+            if (it == tribe_name_cache.end() || it->second != name)
+            {
+                tribe_name_cache[tribe_id] = name;
+                updated = true;
+            }
+        }
+
+        if (updated)
+            tribe_name_dirty.store(true);
+    }
+
+    // Fallback: best-effort fill from TribesDataField (covers offline tribes).
+    if (game_mode)
+    {
+        const auto& tribes = game_mode->TribesDataField();
+        for (int i = 0; i < tribes.Num(); ++i)
+        {
+            auto& data = const_cast<FTribeData&>(tribes[i]);
+            int32_t tid = 0;
+            const int32_t members = TryGetTribeMemberCount(data, tid);
+            if (tid <= 0 || members < 0)
+                continue;
+
+            const int64_t tribe_id = CanonicalTribeId(static_cast<int64_t>(tid));
+            FString name;
+            if (!TryGetTribeNameSafe(&data, &name) || name.IsEmpty())
+                continue;
+
+            bool updated = false;
+            {
+                DataLockGuard lock(data_mutex);
+                auto it = tribe_name_cache.find(tribe_id);
+                if (it == tribe_name_cache.end() || it->second != name)
+                {
+                    tribe_name_cache[tribe_id] = name;
+                    updated = true;
+                }
+            }
+
+            if (updated)
+                tribe_name_dirty.store(true);
+        }
+    }
 }
 
 int64_t Now();
@@ -226,6 +572,15 @@ int64_t Now()
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
+}
+
+int64_t CanonicalTribeId(int64_t raw_id)
+{
+    // ARK tribe/team IDs are effectively 32-bit values.
+    // Normalize to unsigned 32-bit to avoid negative IDs in UI and comparisons.
+    const auto as_i32 = static_cast<int32_t>(raw_id);
+    const auto as_u32 = static_cast<uint32_t>(as_i32);
+    return static_cast<int64_t>(as_u32);
 }
 
 WarPhase GetPhase(const WarRecord& war, int64_t now)
@@ -339,6 +694,8 @@ void LoadData()
         int64_t loaded_next_war_id = json.value("next_war_id", static_cast<int64_t>(1));
 
         std::vector<WarRecord> loaded_wars;
+        const int64_t now = Now();
+        const int64_t max_cooldown = config.cooldown_seconds * 2 + 3600; // allow 2x cooldown + 1hr buffer
 
         if (json.find("wars") != json.end())
         {
@@ -346,8 +703,8 @@ void LoadData()
             {
                 WarRecord war;
                 war.war_id = item.value("war_id", 0);
-                war.tribe_a = item.value("tribe_a", 0);
-                war.tribe_b = item.value("tribe_b", 0);
+                war.tribe_a = CanonicalTribeId(item.value("tribe_a", static_cast<int64_t>(0)));
+                war.tribe_b = CanonicalTribeId(item.value("tribe_b", static_cast<int64_t>(0)));
                 war.declared_at = item.value("declared_at", 0);
                 war.start_at = item.value("start_at", 0);
                 war.ended_at = item.value("ended_at", 0);
@@ -357,8 +714,28 @@ void LoadData()
                 war.cancel_requested_by_b = item.value("cancel_requested_by_b", false);
                 war.start_notified = item.value("start_notified", false);
                 war.cooldown_notified = item.value("cooldown_notified", false);
-                if (war.war_id > 0)
-                    loaded_wars.push_back(war);
+                
+                if (war.war_id <= 0)
+                    continue;
+                if (war.tribe_a == 0 || war.tribe_b == 0)
+                    continue;
+                    
+                // BUGFIX: Ignore expired wars (avoid stale data from file)
+                // If war is ended and both cooldowns are expired, skip it
+                if (war.ended_at != 0)
+                {
+                    if (war.cooldown_end_a > 0 && war.cooldown_end_b > 0 &&
+                        now >= war.cooldown_end_a && now >= war.cooldown_end_b)
+                    {
+                        // War is completely done, discard it
+                        continue;
+                    }
+                    // Also discard if war is WAY too old (data corruption safety)
+                    if (war.declared_at > 0 && now - war.declared_at > max_cooldown)
+                        continue;
+                }
+                
+                loaded_wars.push_back(war);
             }
         }
 
@@ -400,6 +777,10 @@ void SaveConfig()
     json["war_delay_seconds"] = config.war_delay_seconds;
     json["cooldown_seconds"] = config.cooldown_seconds;
     json["structure_damage_multiplier"] = config.structure_damage_multiplier;
+    json["excluded_structure_blueprints"] = config.excluded_structure_blueprints;
+    json["enable_abandoned_structure_window"] = config.enable_abandoned_structure_window;
+    json["abandoned_structure_window_seconds"] = config.abandoned_structure_window_seconds;
+    json["abandoned_structure_damage_multiplier"] = config.abandoned_structure_damage_multiplier;
 
     json["enable_multiuse_menu"] = config.enable_multiuse_menu;
     json["multiuse_require_owned_structure"] = config.multiuse_require_owned_structure;
@@ -433,6 +814,21 @@ void LoadConfig()
         config.war_delay_seconds = json.value("war_delay_seconds", config.war_delay_seconds);
         config.cooldown_seconds = json.value("cooldown_seconds", config.cooldown_seconds);
         config.structure_damage_multiplier = json.value("structure_damage_multiplier", config.structure_damage_multiplier);
+        config.excluded_structure_blueprints.clear();
+        if (json.find("excluded_structure_blueprints") != json.end() && json["excluded_structure_blueprints"].is_array())
+        {
+            for (const auto& item : json["excluded_structure_blueprints"])
+            {
+                if (!item.is_string())
+                    continue;
+                const auto normalized = NormalizeBlueprintPath(item.get<std::string>());
+                if (!normalized.empty())
+                    config.excluded_structure_blueprints.push_back(normalized);
+            }
+        }
+        config.enable_abandoned_structure_window = json.value("enable_abandoned_structure_window", config.enable_abandoned_structure_window);
+        config.abandoned_structure_window_seconds = json.value("abandoned_structure_window_seconds", config.abandoned_structure_window_seconds);
+        config.abandoned_structure_damage_multiplier = json.value("abandoned_structure_damage_multiplier", config.abandoned_structure_damage_multiplier);
 
         config.enable_multiuse_menu = json.value("enable_multiuse_menu", config.enable_multiuse_menu);
         config.multiuse_require_owned_structure = json.value("multiuse_require_owned_structure", config.multiuse_require_owned_structure);
@@ -491,25 +887,25 @@ int64_t GetTribeIdFromActor(AActor* actor)
     if (actor->IsA(AShooterPlayerController::StaticClass()))
     {
         auto* pc = static_cast<AShooterPlayerController*>(actor);
-        return pc->TargetingTeamField();
+        return CanonicalTribeId(pc->TargetingTeamField());
     }
 
     if (actor->IsA(APrimalCharacter::StaticClass()))
     {
         auto* ch = static_cast<APrimalCharacter*>(actor);
-        return ch->TargetingTeamField();
+        return CanonicalTribeId(ch->TargetingTeamField());
     }
 
     if (actor->IsA(APrimalDinoCharacter::StaticClass()))
     {
         auto* dino = static_cast<APrimalDinoCharacter*>(actor);
-        return dino->TargetingTeamField();
+        return CanonicalTribeId(dino->TargetingTeamField());
     }
 
     if (actor->IsA(AController::StaticClass()))
     {
         auto* controller = static_cast<AController*>(actor);
-        return controller->TargetingTeamField();
+        return CanonicalTribeId(controller->TargetingTeamField());
     }
 
     return 0;
@@ -519,7 +915,131 @@ int64_t GetTribeIdFromPlayer(AShooterPlayerController* pc)
 {
     if (!pc)
         return 0;
-    return pc->TargetingTeamField();
+    const auto raw = pc->TargetingTeamField();
+    const auto canonical = CanonicalTribeId(raw);
+    return canonical;
+}
+
+int32_t TryGetTribeMemberCount(FTribeData& data, int32_t& out_tribe_id)
+{
+    __try
+    {
+        out_tribe_id = data.TribeIDField();
+        int32_t count = data.MembersPlayerDataIDField().Num();
+        if (count <= 0)
+            count = data.MembersPlayerNameField().Num();
+        return count;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        out_tribe_id = 0;
+        return -1;
+    }
+}
+
+void UpdateAbandonedTribes(int64_t now)
+{
+    if (!config.enable_abandoned_structure_window)
+        return;
+
+    if (ArkApi::GetApiUtils().GetStatus() != ArkApi::ServerStatus::Ready)
+        return;
+
+    auto* game_mode = ArkApi::GetApiUtils().GetShooterGameMode();
+    if (!game_mode)
+        return;
+
+    const int32_t window = (std::max)(0, config.abandoned_structure_window_seconds);
+    if (window <= 0)
+        return;
+
+    try
+    {
+        const auto& tribes = game_mode->TribesDataField();
+        DataLockGuard lock(data_mutex);
+
+        // Cleanup expired entries (keep map small).
+        for (auto it = abandoned_tribe_until.begin(); it != abandoned_tribe_until.end();)
+        {
+            if (it->second <= now)
+                it = abandoned_tribe_until.erase(it);
+            else
+                ++it;
+        }
+
+        for (int i = 0; i < tribes.Num(); ++i)
+        {
+            auto& data = const_cast<FTribeData&>(tribes[i]);
+            int32_t tid = 0;
+            const int32_t members = TryGetTribeMemberCount(data, tid);
+            if (tid <= 0 || members < 0)
+                continue;
+
+            if (members == 0)
+            {
+                // Start/refresh the window from "now" when tribe is observed as empty.
+                abandoned_tribe_until[CanonicalTribeId(static_cast<int64_t>(tid))] = now + window;
+            }
+            else
+            {
+                abandoned_tribe_until.erase(CanonicalTribeId(static_cast<int64_t>(tid)));
+            }
+        }
+    }
+    catch (...)
+    {
+        // ignore
+    }
+}
+
+bool IsAbandonedStructureVulnerable(int64_t target_tribe_id, int64_t now, float& out_multiplier)
+{
+    out_multiplier = 1.0f;
+    if (!config.enable_abandoned_structure_window)
+        return false;
+    target_tribe_id = CanonicalTribeId(target_tribe_id);
+    if (target_tribe_id == 0)
+        return false;
+
+    const float mult = config.abandoned_structure_damage_multiplier;
+    DataLockGuard lock(data_mutex);
+    auto it = abandoned_tribe_until.find(target_tribe_id);
+    if (it == abandoned_tribe_until.end())
+        return false;
+    if (it->second <= now)
+        return false;
+
+    out_multiplier = mult;
+    return true;
+}
+
+bool IsExcludedStructure(APrimalStructure* structure)
+{
+    if (!structure)
+        return false;
+    if (config.excluded_structure_blueprints.empty())
+        return false;
+
+    auto* cls = structure->ClassField();
+    if (!cls)
+        return false;
+    if (!cls->IsValidLowLevelFast(true))
+        return false;
+
+    FString path;
+    if (!TryGetPathNameSafe(cls, &path))
+        return false;
+    const auto normalized = NormalizeBlueprintPath(path.ToString());
+    if (normalized.empty())
+        return false;
+
+    for (const auto& excluded : config.excluded_structure_blueprints)
+    {
+        if (normalized.find(excluded) != std::string::npos)
+            return true;
+    }
+
+    return false;
 }
 
 AShooterPlayerState* GetPlayerState(AShooterPlayerController* pc)
@@ -549,7 +1069,19 @@ bool IsTribeLeaderOrAdmin(AShooterPlayerController* pc)
         return false;
 
     const auto player_data_id = data_struct->PlayerDataIDField();
-    return ps->IsTribeOwner(static_cast<unsigned int>(player_data_id));
+    
+    // BUGFIX: Check multiple conditions for tribe owner status
+    // In case founder/owner flags don't sync properly after tribe recreation
+    if (ps->IsTribeOwner(static_cast<unsigned int>(player_data_id)))
+        return true;
+    
+    // FALLBACK: If player has valid MyTribeData, they're in a tribe
+    // Allow them to use war commands (especially after tribe recreation)
+    auto* my_tribe = ps->MyTribeDataField();
+    if (my_tribe)
+        return true;
+
+    return false;
 }
 
 bool IsTribeLeaderOrAdminOnline(int64_t tribe_id)
@@ -565,11 +1097,29 @@ bool IsTribeLeaderOrAdminOnline(int64_t tribe_id)
         return false;
 
     auto& players = world->PlayerControllerListField();
+    
+    // BUGFIX: Simply check if ANY member of the tribe is online
+    // Don't require strict leader/admin status verification (can be out of sync after tribe creation)
+    // ALSO: Verify PlayerController is actually valid (not disconnected/pending)
     for (TWeakObjectPtr<APlayerController>& player : players)
     {
         auto* pc = static_cast<AShooterPlayerController*>(player.Get());
-        if (pc && GetTribeIdFromPlayer(pc) == tribe_id && IsTribeLeaderOrAdmin(pc))
+        if (!pc)
+            continue;
+        
+        // CRITICAL: Check validity - avoid disconnected/pending controllers
+        if (!pc->IsValidLowLevelFast(true))
+            continue;
+        if (!pc->IsA(AShooterPlayerController::StaticClass()))
+            continue;
+            
+        const int64_t player_tribe = GetTribeIdFromPlayer(pc);
+        if (player_tribe == tribe_id)
+        {
+            // Found at least one VALID online member of this tribe
+            // Tribe can receive war declarations
             return true;
+        }
     }
 
     return false;
@@ -584,7 +1134,17 @@ void SendPlayerMessage(AShooterPlayerController* pc, const FString& message)
     ArkApi::GetApiUtils().SendNotification(pc, FLinearColor(1.0f, 0.85f, 0.1f, 1.0f), 1.0f, 6.0f, nullptr, L"{}", *message);
 }
 
-void NotifyTribe(int64_t tribe_id, const FString& message)
+void SendPlayerMessageStyled(AShooterPlayerController* pc, const FString& message, const FLinearColor& color, float scale, float time)
+{
+    if (!pc)
+        return;
+    const FString sender_name(L"Mega Tribe War");
+    ArkApi::GetApiUtils().SendChatMessage(pc, sender_name, L"{}", *message);
+    ArkApi::GetApiUtils().SendNotification(pc, color, scale, time, nullptr, L"{}", *message);
+}
+
+// Notify all online players who are on the given side: the tribe itself + allied tribes.
+void NotifySide(int64_t side_tribe_id, const FString& message)
 {
     if (ArkApi::GetApiUtils().GetStatus() != ArkApi::ServerStatus::Ready)
         return;
@@ -593,12 +1153,66 @@ void NotifyTribe(int64_t tribe_id, const FString& message)
     if (!world)
         return;
 
+    auto* game_mode = ArkApi::GetApiUtils().GetShooterGameMode();
+
     auto& players = world->PlayerControllerListField();
     for (TWeakObjectPtr<APlayerController>& player : players)
     {
         auto* pc = static_cast<AShooterPlayerController*>(player.Get());
-        if (pc && GetTribeIdFromPlayer(pc) == tribe_id)
+        if (!pc)
+            continue;
+
+        const auto player_tribe_id = GetTribeIdFromPlayer(pc);
+        if (player_tribe_id == 0 || side_tribe_id == 0)
+            continue;
+
+        if (player_tribe_id == side_tribe_id)
+        {
             SendPlayerMessage(pc, message);
+            continue;
+        }
+
+        if (game_mode && game_mode->AreTribesAllied(static_cast<int>(player_tribe_id), static_cast<int>(side_tribe_id)))
+        {
+            SendPlayerMessage(pc, message);
+            continue;
+        }
+    }
+}
+
+void NotifySideStyled(int64_t side_tribe_id, const FString& message, const FLinearColor& color, float scale, float time)
+{
+    if (ArkApi::GetApiUtils().GetStatus() != ArkApi::ServerStatus::Ready)
+        return;
+
+    auto* world = ArkApi::GetApiUtils().GetWorld();
+    if (!world)
+        return;
+
+    auto* game_mode = ArkApi::GetApiUtils().GetShooterGameMode();
+
+    auto& players = world->PlayerControllerListField();
+    for (TWeakObjectPtr<APlayerController>& player : players)
+    {
+        auto* pc = static_cast<AShooterPlayerController*>(player.Get());
+        if (!pc)
+            continue;
+
+        const auto player_tribe_id = GetTribeIdFromPlayer(pc);
+        if (player_tribe_id == 0 || side_tribe_id == 0)
+            continue;
+
+        if (player_tribe_id == side_tribe_id)
+        {
+            SendPlayerMessageStyled(pc, message, color, scale, time);
+            continue;
+        }
+
+        if (game_mode && game_mode->AreTribesAllied(static_cast<int>(player_tribe_id), static_cast<int>(side_tribe_id)))
+        {
+            SendPlayerMessageStyled(pc, message, color, scale, time);
+            continue;
+        }
     }
 }
 
@@ -625,6 +1239,7 @@ WarRecord* GetWarForTribeLocked(int64_t tribe_id)
 
 std::optional<WarRecord> GetWarForTribeCopy(int64_t tribe_id)
 {
+    tribe_id = CanonicalTribeId(tribe_id);
     DataLockGuard lock(data_mutex);
     if (auto* war = GetWarForTribeLocked(tribe_id))
     {
@@ -635,8 +1250,54 @@ std::optional<WarRecord> GetWarForTribeCopy(int64_t tribe_id)
     return std::nullopt;
 }
 
+struct WarView
+{
+    WarRecord war;
+    int64_t side_root = 0; // war.tribe_a or war.tribe_b that this tribe belongs to (directly or via alliance)
+};
+
+std::optional<WarView> GetWarForSideCopy(int64_t tribe_id)
+{
+    if (tribe_id == 0)
+        return std::nullopt;
+
+    // Fast path: direct participant.
+    if (auto direct = GetWarForTribeCopy(tribe_id))
+    {
+        const auto& war = *direct;
+        const int64_t side_root = (tribe_id == war.tribe_a) ? war.tribe_a : war.tribe_b;
+        return WarView{ war, side_root };
+    }
+
+    auto* game_mode = ArkApi::GetApiUtils().GetShooterGameMode();
+    if (!game_mode)
+        return std::nullopt;
+
+    const auto now = Now();
+    DataLockGuard lock(data_mutex);
+    for (const auto& it : wars_by_id)
+    {
+        const auto& war = it.second;
+        if (GetPhase(war, now) == WarPhase::None)
+            continue;
+
+        const bool on_a = (tribe_id == war.tribe_a) ||
+                          game_mode->AreTribesAllied(static_cast<int>(tribe_id), static_cast<int>(war.tribe_a));
+        const bool on_b = (tribe_id == war.tribe_b) ||
+                          game_mode->AreTribesAllied(static_cast<int>(tribe_id), static_cast<int>(war.tribe_b));
+
+        if (on_a == on_b)
+            continue;
+
+        return WarView{ war, on_a ? war.tribe_a : war.tribe_b };
+    }
+
+    return std::nullopt;
+}
+
 bool IsTribeInCooldown(int64_t tribe_id, int64_t now)
 {
+    tribe_id = CanonicalTribeId(tribe_id);
     DataLockGuard lock(data_mutex);
     auto* war = GetWarForTribeLocked(tribe_id);
     if (!war)
@@ -682,6 +1343,8 @@ bool CleanupExpiredWarsLocked(int64_t now)
 
 bool IsWarAllowed(int64_t tribe_a, int64_t tribe_b, int64_t now, FString& reason)
 {
+    tribe_a = CanonicalTribeId(tribe_a);
+    tribe_b = CanonicalTribeId(tribe_b);
     if (tribe_a == 0 || tribe_b == 0)
     {
         reason = L"Вы должны состоять в племени.";
@@ -692,6 +1355,16 @@ bool IsWarAllowed(int64_t tribe_a, int64_t tribe_b, int64_t now, FString& reason
     {
         reason = L"Нельзя объявить войну своему племени.";
         return false;
+    }
+
+    if (ArkApi::GetApiUtils().GetStatus() == ArkApi::ServerStatus::Ready)
+    {
+        auto* game_mode = ArkApi::GetApiUtils().GetShooterGameMode();
+        if (game_mode && game_mode->AreTribesAllied(static_cast<int>(tribe_a), static_cast<int>(tribe_b)))
+        {
+            reason = L"Нельзя объявить войну союзному племени. Сначала разорвите альянс.";
+            return false;
+        }
     }
 
     if (GetWarForTribeCopy(tribe_a).has_value() || GetWarForTribeCopy(tribe_b).has_value())
@@ -717,6 +1390,8 @@ bool IsWarAllowed(int64_t tribe_a, int64_t tribe_b, int64_t now, FString& reason
 
 void DeclareWar(int64_t tribe_a, int64_t tribe_b)
 {
+    tribe_a = CanonicalTribeId(tribe_a);
+    tribe_b = CanonicalTribeId(tribe_b);
     WarRecord war;
     {
         DataLockGuard lock(data_mutex);
@@ -731,13 +1406,16 @@ void DeclareWar(int64_t tribe_a, int64_t tribe_b)
     need_save.store(true);
 
     const FString delay = FormatDuration(config.war_delay_seconds);
-    NotifyTribe(tribe_a, FString::Format(L"Война объявлена. Начало через {}.", *delay));
-    NotifyTribe(tribe_b, FString::Format(L"Вашему племени объявили войну. Начало через {}.", *delay));
+    const FString tribe_a_name = GetTribeDisplayName(tribe_a);
+    const FString tribe_b_name = GetTribeDisplayName(tribe_b);
+    NotifySide(tribe_a, FString::Format(L"Вы объявили войну племени {}. Начало через {}.", *tribe_b_name, *delay));
+    NotifySide(tribe_b, FString::Format(L"Племя {} объявило вам войну. Начало через {}.", *tribe_a_name, *delay));
     // Logging disabled to avoid crashes in early init
 }
 
 void RequestCancelWar(int64_t tribe_id)
 {
+    tribe_id = CanonicalTribeId(tribe_id);
     int64_t other = 0;
     int64_t war_id = 0;
     {
@@ -757,13 +1435,14 @@ void RequestCancelWar(int64_t tribe_id)
         other = tribe_id == war->tribe_a ? war->tribe_b : war->tribe_a;
     }
     need_save.store(true);
-    NotifyTribe(other, L"Получен запрос на отмену войны. Чтобы отменить введите /accept");
-    NotifyTribe(tribe_id, L"Запрос на отмену войны отправлен.");
+    NotifySide(other, L"Противник запросил отмену войны. Чтобы подтвердить, введите /accept.");
+    NotifySide(tribe_id, L"Запрос на отмену войны отправлен. Ожидайте подтверждения /accept от противника.");
     // Logging disabled to avoid crashes in early init
 }
 
 void AcceptCancelWar(int64_t tribe_id)
 {
+    tribe_id = CanonicalTribeId(tribe_id);
     WarRecord snapshot;
     bool canceled = false;
 
@@ -800,13 +1479,15 @@ void AcceptCancelWar(int64_t tribe_id)
         return;
 
     const FString cooldown = FormatDuration(config.cooldown_seconds);
-    NotifyTribe(snapshot.tribe_a, FString::Format(L"Война отменена. Начался откат ({}).", *cooldown));
-    NotifyTribe(snapshot.tribe_b, FString::Format(L"Война отменена. Начался откат ({}).", *cooldown));
+    const FString msg = FString::Format(L"Война отменена. Начался откат ({}).", *cooldown);
+    NotifySideStyled(snapshot.tribe_a, msg, FLinearColor(0.2f, 1.0f, 0.2f, 1.0f), 1.4f, 8.0f);
+    NotifySideStyled(snapshot.tribe_b, msg, FLinearColor(0.2f, 1.0f, 0.2f, 1.0f), 1.4f, 8.0f);
     // Logging disabled to avoid crashes in early init
 }
 
 bool HasIncomingCancel(int64_t tribe_id)
 {
+    tribe_id = CanonicalTribeId(tribe_id);
     DataLockGuard lock(data_mutex);
     auto* war = GetWarForTribeLocked(tribe_id);
     if (!war)
@@ -819,9 +1500,9 @@ bool HasIncomingCancel(int64_t tribe_id)
     return false;
 }
 
-std::vector<std::pair<int64_t, FString>> ProcessTimers()
+std::vector<PendingNotification> ProcessTimers()
 {
-    std::vector<std::pair<int64_t, FString>> notifications_out;
+    std::vector<PendingNotification> notifications_out;
     
     if (!auto_timers_enabled)
         return notifications_out;
@@ -853,8 +1534,17 @@ std::vector<std::pair<int64_t, FString>> ProcessTimers()
                     war.start_at = now + config.war_delay_seconds;
                 if (war.ended_at == 0 && now >= war.start_at && !war.start_notified)
                 {
-                    notifications_out.emplace_back(war.tribe_a, FString(L"Война началась."));
-                    notifications_out.emplace_back(war.tribe_b, FString(L"Война началась."));
+                    PendingNotification n;
+                    n.styled = true;
+                    n.color = FLinearColor(1.0f, 0.15f, 0.15f, 1.0f);
+                    n.scale = 2.2f;
+                    n.time = 12.0f;
+                    n.message = FString(L"Война началась!");
+
+                    n.side_tribe_id = war.tribe_a;
+                    notifications_out.push_back(n);
+                    n.side_tribe_id = war.tribe_b;
+                    notifications_out.push_back(n);
                     war.start_notified = true;
                     changed = true;
 
@@ -882,8 +1572,8 @@ std::vector<std::pair<int64_t, FString>> ProcessTimers()
                 {
                     if (!war.cooldown_notified && now >= war.cooldown_end_a && now >= war.cooldown_end_b)
                     {
-                        notifications_out.emplace_back(war.tribe_a, FString(L"Откат закончился."));
-                        notifications_out.emplace_back(war.tribe_b, FString(L"Откат закончился."));
+                        notifications_out.push_back(PendingNotification{ war.tribe_a, FString(L"Откат закончился.") });
+                        notifications_out.push_back(PendingNotification{ war.tribe_b, FString(L"Откат закончился.") });
                         war.cooldown_notified = true;
                         changed = true;
 
@@ -926,7 +1616,7 @@ std::vector<std::pair<int64_t, FString>> ProcessTimers()
     return notifications_out;
 }
 
-void EnqueueNotifications(const std::vector<std::pair<int64_t, FString>>& notes)
+void EnqueueNotifications(const std::vector<PendingNotification>& notes)
 {
     if (notes.empty())
         return;
@@ -936,7 +1626,7 @@ void EnqueueNotifications(const std::vector<std::pair<int64_t, FString>>& notes)
 
 void FlushNotificationQueue()
 {
-    std::vector<std::pair<int64_t, FString>> local;
+    std::vector<PendingNotification> local;
     {
         DataLockGuard lock(notification_mutex);
         if (pending_notifications.empty())
@@ -945,13 +1635,21 @@ void FlushNotificationQueue()
     }
 
     for (const auto& note : local)
-        NotifyTribe(note.first, note.second);
+    {
+        if (note.styled)
+            NotifySideStyled(note.side_tribe_id, note.message, note.color, note.scale, note.time);
+        else
+            NotifySide(note.side_tribe_id, note.message);
+    }
 }
 
 void TimerCallback()
 {
     if (!plugin_initialized)
         return;
+
+    UpdateTribeNameCache();
+    UpdateAbandonedTribes(Now());
 
     auto notifications = ProcessTimers();
     EnqueueNotifications(notifications);
@@ -960,6 +1658,7 @@ void TimerCallback()
         FlushNotificationQueue();
 
     FlushSaveIfNeeded();
+    SaveTribeNameCache();
 }
 
 std::vector<WarRecord> GetActiveWarsSnapshot(int64_t now)
@@ -985,7 +1684,11 @@ bool IsStructureDamageAllowed(APrimalStructure* structure, AController* instigat
     if (ArkApi::GetApiUtils().GetStatus() != ArkApi::ServerStatus::Ready)
         return false;
 
-    const auto target_tribe = structure->TargetingTeamField();
+    if (IsExcludedStructure(structure))
+        return true;
+
+    const auto now = Now();
+    const auto target_tribe = CanonicalTribeId(structure->TargetingTeamField());
     int64_t attacker_tribe = 0;
 
     if (instigator)
@@ -994,12 +1697,31 @@ bool IsStructureDamageAllowed(APrimalStructure* structure, AController* instigat
         attacker_tribe = GetTribeIdFromActor(causer);
 
     if (target_tribe == 0 || attacker_tribe == 0)
+    {
+        // If attacker has no tribe, only allow against abandoned tribes (optional feature).
+        if (target_tribe != 0)
+        {
+            float abandoned_mult = 1.0f;
+            if (IsAbandonedStructureVulnerable(target_tribe, now, abandoned_mult))
+            {
+                out_multiplier = abandoned_mult;
+                return true;
+            }
+        }
         return false;
+    }
 
     if (target_tribe == attacker_tribe)
         return true;
 
-    const auto now = Now();
+    // Abandoned tribe window: structures can be damaged by anyone.
+    float abandoned_mult = 1.0f;
+    if (IsAbandonedStructureVulnerable(target_tribe, now, abandoned_mult))
+    {
+        out_multiplier = abandoned_mult;
+        return true;
+    }
+
     auto* game_mode = ArkApi::GetApiUtils().GetShooterGameMode();
     if (!game_mode)
         return false;
@@ -1090,8 +1812,9 @@ void HandleMenuAction(AShooterPlayerController* pc, int entry_id)
     // Check radial menu constants first (backward compat)
     if (entry_id == kMenuStatusId || entry_id == kMuStatusId)
     {
-        const auto war = GetWarForTribeCopy(tribe_id);
-        SendPlayerMessage(pc, GetStatusText(war ? &(*war) : nullptr, tribe_id));
+        const auto war_view = GetWarForSideCopy(tribe_id);
+        const int64_t side_root = war_view ? war_view->side_root : tribe_id;
+        SendPlayerMessage(pc, GetStatusText(war_view ? &war_view->war : nullptr, side_root));
         return;
     }
 
@@ -1155,8 +1878,9 @@ void HandleMenuAction(AShooterPlayerController* pc, int entry_id)
     const int action = action_entry->second;
     if (action == 1) // status
     {
-        const auto war = GetWarForTribeCopy(tribe_id);
-        SendPlayerMessage(pc, GetStatusText(war ? &(*war) : nullptr, tribe_id));
+        const auto war_view = GetWarForSideCopy(tribe_id);
+        const int64_t side_root = war_view ? war_view->side_root : tribe_id;
+        SendPlayerMessage(pc, GetStatusText(war_view ? &war_view->war : nullptr, side_root));
     }
     else if (action == 2) // cancel
     {
@@ -1272,23 +1996,37 @@ void BuildDeclareListMenu(AShooterPlayerController* pc, TArray<FTribeRadialMenuE
     if (!game_mode)
         return;
     const auto& tribes = game_mode->TribesDataField();
+    std::unordered_set<int64_t> seen_ids;
     for (int i = 0; i < tribes.Num(); ++i)
     {
         auto& data = const_cast<FTribeData&>(tribes[i]);
         if (list_count >= kMenuDeclareListMax)
             break;
-        if (data.TribeIDField() == tribe_id)
+        int32_t tid = 0;
+        const int32_t members = TryGetTribeMemberCount(data, tid);
+        if (members <= 0)
             continue;
-        if (GetWarForTribeCopy(data.TribeIDField()).has_value() || IsTribeInCooldown(data.TribeIDField(), now))
+        const int64_t other_id = CanonicalTribeId(static_cast<int64_t>(tid));
+        if (other_id == 0)
+            continue;
+        if (other_id == tribe_id)
+            continue;
+        if (!seen_ids.insert(other_id).second)
+            continue;
+        if (GetWarForTribeCopy(other_id).has_value() || IsTribeInCooldown(other_id, now))
             continue;
 
         FTribeRadialMenuEntry item;
-        item.EntryName = data.TribeNameField();
+        const FString entry_label = GetTribeDisplayName(other_id);
+        if (!entry_label.IsEmpty())
+            item.EntryName = entry_label;
+        else
+            item.EntryName = FString::Format(L"ID: {}", other_id);
         item.EntryDescription = FString(L"Объявить войну");
         item.EntryID = kMenuDeclareListBaseId + list_count;
         item.ParentID = kMenuDeclareId;
         entries->Add(item);
-        declare_targets[player_key][item.EntryID] = data.TribeIDField();
+        declare_targets[player_key][item.EntryID] = other_id;
         ++list_count;
     }
 }
@@ -1374,20 +2112,33 @@ static void BuildDeclareListMultiUse(AShooterPlayerController* pc, int64_t tribe
     const auto& tribes = game_mode->TribesDataField();
 
     int list_count = 0;
+    std::unordered_set<int64_t> seen_ids;
     for (int i = 0; i < tribes.Num(); ++i)
     {
         if (list_count >= max_targets)
             break;
         auto& data = const_cast<FTribeData&>(tribes[i]);
-        if (data.TribeIDField() == tribe_id)
+        int32_t tid = 0;
+        const int32_t members = TryGetTribeMemberCount(data, tid);
+        if (members <= 0)
             continue;
-        if (GetWarForTribeCopy(data.TribeIDField()).has_value() || IsTribeInCooldown(data.TribeIDField(), now))
+        const int64_t other_id = CanonicalTribeId(static_cast<int64_t>(tid));
+        if (other_id == 0)
+            continue;
+        if (other_id == tribe_id)
+            continue;
+        if (!seen_ids.insert(other_id).second)
+            continue;
+        if (GetWarForTribeCopy(other_id).has_value() || IsTribeInCooldown(other_id, now))
             continue;
 
         const int entry_id = next_index++;
-        const auto label = FString::Format(L"Объявить войну: {}", *data.TribeNameField());
+        const FString display_name = GetTribeDisplayName(other_id);
+        const auto label = display_name.IsEmpty()
+            ? FString::Format(L"Объявить войну: ID {}", other_id)
+            : FString::Format(L"Объявить войну: {}", *display_name);
         AddMultiUseEntry(entries, entry_id, label);
-        declare_targets[player_key][entry_id] = data.TribeIDField();
+        declare_targets[player_key][entry_id] = other_id;
         multiuse_action_map[player_key][entry_id] = 100 + list_count; // action=declare target #N
         ++list_count;
     }
@@ -1660,8 +2411,9 @@ void CmdWarStatus(AShooterPlayerController* pc, FString*, EChatSendMode::Type)
         return;
     }
 
-    const auto war = GetWarForTribeCopy(tribe_id);
-    const FString status = GetStatusText(war ? &(*war) : nullptr, tribe_id);
+    const auto war_view = GetWarForSideCopy(tribe_id);
+    const int64_t side_root = war_view ? war_view->side_root : tribe_id;
+    const FString status = GetStatusText(war_view ? &war_view->war : nullptr, side_root);
     SendPlayerMessage(pc, status);
 }
 
@@ -1669,6 +2421,8 @@ void CmdWarDeclare(AShooterPlayerController* pc, FString*, EChatSendMode::Type)
 {
     if (!pc)
         return;
+
+    UpdateTribeNameCache();
 
     const auto tribe_id = GetTribeIdFromPlayer(pc);
     if (tribe_id == 0)
@@ -1690,33 +2444,57 @@ void CmdWarDeclare(AShooterPlayerController* pc, FString*, EChatSendMode::Type)
         return;
     }
 
-    auto* game_mode = ArkApi::GetApiUtils().GetShooterGameMode();
-    if (!game_mode)
+    if (ArkApi::GetApiUtils().GetStatus() != ArkApi::ServerStatus::Ready)
         return;
 
-    FString message(L"Список племён:\n");
-    int count = 0;
-    const auto& tribes = game_mode->TribesDataField();
-    for (int i = 0; i < tribes.Num(); ++i)
+    auto* world = ArkApi::GetApiUtils().GetWorld();
+    if (!world)
+        return;
+
+    // BUGFIX: Build tribe list from currently online players (more reliable than TribesDataField)
+    // This avoids race conditions where TribesDataField may be out of sync with PlayerControllerList
+    std::unordered_set<int64_t> available_tribes;
+    auto& players = world->PlayerControllerListField();
+    for (TWeakObjectPtr<APlayerController>& player : players)
     {
-        auto& data = const_cast<FTribeData&>(tribes[i]);
-        if (data.TribeIDField() == tribe_id)
+        auto* check_pc = static_cast<AShooterPlayerController*>(player.Get());
+        
+        // CRITICAL BUGFIX: Validate player is actually active (not disconnected/pending)
+        if (!check_pc)
             continue;
-        if (GetWarForTribeCopy(data.TribeIDField()).has_value() || IsTribeInCooldown(data.TribeIDField(), now))
+        if (!check_pc->IsValidLowLevelFast(true))
+            continue;
+        if (check_pc->IsA(AShooterPlayerController::StaticClass()) == false)
             continue;
 
-        message += FString::Format(L"{} (ID: {})\n", *data.TribeNameField(), data.TribeIDField());
-        count++;
+        const int64_t check_tribe = GetTribeIdFromPlayer(check_pc);
+        if (check_tribe == 0 || check_tribe == tribe_id)
+            continue;
+
+        // Skip if this tribe has an active war or cooldown
+        if (GetWarForTribeCopy(check_tribe).has_value() || IsTribeInCooldown(check_tribe, now))
+            continue;
+
+        available_tribes.insert(check_tribe);
     }
 
-    if (count == 0)
+    if (available_tribes.empty())
     {
         SendPlayerMessage(pc, L"Нет доступных племён для объявления войны.");
         return;
     }
 
-    message += L"\nИспользуйте /war <tribe_id>, чтобы объявить войну.\n";
-    message += L"Если лидер/админ выбранного племени не в сети, объявить войну не получится.";
+    FString message(L"Список племён:\n");
+    for (const auto other_id : available_tribes)
+    {
+        const FString display_name = GetTribeDisplayName(other_id);
+        if (!display_name.IsEmpty())
+            message += FString::Format(L"{}\n", *display_name);
+        else
+            message += FString::Format(L"ID: {}\n", other_id);
+    }
+
+    message += L"\nИспользуйте /war <tribe_id>, чтобы объявить войну.";
     SendPlayerMessage(pc, message);
 }
 
@@ -1754,7 +2532,10 @@ void CmdWarDeclareId(AShooterPlayerController* pc, FString* message, EChatSendMo
     int64_t target_id = 0;
     try
     {
-        target_id = std::stoll(parsed[arg_index].ToString());
+        const uint64_t raw = std::stoull(parsed[arg_index].ToString());
+        if (raw == 0 || raw > 0xFFFFFFFFULL)
+            throw std::out_of_range("tribe_id");
+        target_id = static_cast<int64_t>(raw);
     }
     catch (...)
     {
@@ -1900,6 +2681,7 @@ void InitPlugin()
     std::filesystem::create_directories(GetPluginDir());
     LoadConfig();
     LoadData();
+    LoadTribeNameCache();
 
     AppendMultiUseDebugLog(std::string("InitPlugin: enable_multiuse_menu=") + (config.enable_multiuse_menu ? "true" : "false") +
                            " require_owned=" + (config.multiuse_require_owned_structure ? "true" : "false") +
@@ -1987,6 +2769,7 @@ void Unload()
         if (plugin_initialized)
         {
             SaveData();
+            SaveTribeNameCache();
         }
 
 #if TRIBEWAR_ENABLE_CHAT_COMMANDS

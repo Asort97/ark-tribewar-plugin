@@ -1,5 +1,22 @@
 {
   "war_delay_seconds": 43200,
   "cooldown_seconds": 172800,
-  "structure_damage_multiplier": 1.0
+  "structure_damage_multiplier": 1.0,
+  "excluded_structure_blueprints": [
+    "Blueprint'/Game/Mods/SimpleSpawners/ResourceSpawns/Rocks/SS_SaltResource.SS_SaltResource_C'",
+    "Blueprint'/Game/Mods/SimpleSpawners/ResourceSpawns/Rocks/SS_SulfurResource.SS_SulfurResource_C'",
+    "Blueprint'/Game/Mods/SimpleSpawners/ResourceSpawns/Rocks/SS_RedGemResource.SS_RedGemResource_C'",
+    "Blueprint'/Game/Mods/SimpleSpawners/ResourceSpawns/Rocks/SS_GreenGemResource.SS_GreenGemResource_C'",
+    "Blueprint'/Game/Mods/SimpleSpawners/ResourceSpawns/Rocks/SS_BlueGemResource.SS_BlueGemResource_C'",
+    "Blueprint'/Game/Mods/SimpleSpawners/ResourceSpawns/Rocks/SS_SandyRockResource.SS_SandyRockResource_C'",
+    "Blueprint'/Game/Mods/SimpleSpawners/ResourceSpawns/Trees/SS_AberrantTreeResource.SS_AberrantTreeResource_C'",
+    "Blueprint'/Game/Mods/SimpleSpawners/ResourceSpawns/Trees/SS_MassiveCactusResource.SS_MassiveCactusResource_C'",
+    "Blueprint'/Game/Mods/SimpleSpawners/ResourceSpawns/Usables/SS_SandPileResource.SS_SandPileResource_C'",
+    "Blueprint'/Game/Mods/SimpleSpawners/ResourceSpawns/Usables/SS_MushroomPatchResource.SS_MushroomPatchResource_C'",
+    "Blueprint'/Game/Mods/SimpleSpawners/ResourceSpawns/Usables/SS_MushroomPoisonResource.SS_MushroomPoisonResource_C'",
+    "Blueprint'/Game/Extinction/Structures/ItemBalloon/StorageBox_Balloon.StorageBox_Balloon_C'"
+  ],
+  "enable_abandoned_structure_window": true,
+  "abandoned_structure_window_seconds": 43200,
+  "abandoned_structure_damage_multiplier": 1.0
 }

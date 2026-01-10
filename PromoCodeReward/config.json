@@ -1,0 +1,16 @@
+{
+  "command": "/promo",
+  "case_sensitive": false,
+  "promos": [
+    {
+      "code": "Bobby",
+      "blueprint": "Blueprint'/Game/Mods/KsMissions/Items/PrimalItem_Goldcoin.PrimalItem_Goldcoin'",
+      "quantity": 1,
+      "quality": 1.0,
+      "force_blueprint": false,
+      "one_time_per_player": true,
+      "max_total_uses": 0
+    }
+  ]
+}
+
